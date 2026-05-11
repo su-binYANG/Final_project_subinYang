@@ -1,0 +1,25 @@
+{
+  "fluid_hot": "Water",
+  "fluid_cold": "Water",
+
+  "L": 5.0,
+  "N": 100,
+
+  "D_inner": 0.012,
+  "D_outer": 0.016,
+  "t_wall": 0.002,
+  "k_wall": 16.0,
+
+  "m_dot_hot": 0.4,
+  "m_dot_cold": 0.08,
+
+  "P_hot": 15000000,
+  "P_cold": 5000000,
+
+  "T_hot_in": 580.0,
+  "T_cold_in": 420.0,
+
+  "q_flux": 50000,
+
+  "flow": "counter"
+}
