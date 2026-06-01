@@ -5,6 +5,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from CoolProp.CoolProp import PropsSI
 
+FLIP_PLOT_LEFT_RIGHT = True
+
 
 # ============================================================
 # Correlations
@@ -621,7 +623,13 @@ plt.annotate(
     fontsize=11
 )
 
-plt.xlabel("Position x [m]  (left = 0, right = L)", fontsize=12)
+if FLIP_PLOT_LEFT_RIGHT:
+    plt.gca().invert_xaxis()
+    xlabel = "Position x [m]  (left = L, right = 0)"
+else:
+    xlabel = "Position x [m]  (left = 0, right = L)"
+
+plt.xlabel(xlabel, fontsize=12)
 plt.ylabel("Temperature [°C]", fontsize=12)
 
 plt.title(

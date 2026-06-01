@@ -5,6 +5,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from CoolProp.CoolProp import PropsSI
 
+FLIP_PLOT_LEFT_RIGHT = True
+
 
 # ============================================================
 # Basic correlations
@@ -620,7 +622,13 @@ if boiling_indices.size > 0:
         label="Boiling region"
     )
 
-ax1.set_xlabel("Position x [m]  (left = 0, right = L)")
+if FLIP_PLOT_LEFT_RIGHT:
+    ax1.invert_xaxis()
+    xlabel = "Position x [m]  (left = L, right = 0)"
+else:
+    xlabel = "Position x [m]  (left = 0, right = L)"
+
+ax1.set_xlabel(xlabel)
 ax1.set_ylabel("Temperature [°C]")
 ax1.grid(True, linestyle="--", alpha=0.5)
 

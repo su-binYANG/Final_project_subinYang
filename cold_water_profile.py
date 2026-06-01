@@ -33,7 +33,7 @@ params = {
     "m_dot_cold": 0.08,
 
     "P_hot": 15000000,
-    "P_cold": 5000000,
+    "P_cold": 6000000,
 
     "T_hot_in": 580.0,
     "T_cold_in": 420.0,
@@ -264,9 +264,9 @@ def plot_cold_profile(df_nodes, summary, params):
     mask_boil = phase == "boiling"
     mask_sup = phase == "superheated"
 
-    ax.plot(x[mask_sub], T[mask_sub], "b-", lw=2)
-    ax.plot(x[mask_boil], T[mask_boil], "r-", lw=2)
-    ax.plot(x[mask_sup], T[mask_sup], "g-", lw=2)
+    ax.plot(x[mask_sub], T[mask_sub], "b-", lw=2, drawstyle="steps-post")
+    ax.plot(x[mask_boil], T[mask_boil], "r-", lw=2, drawstyle="steps-post")
+    ax.plot(x[mask_sup], T[mask_sup], "g-", lw=2, drawstyle="steps-post")
 
     ax.plot(x, T, "bo", ms=3)
 
