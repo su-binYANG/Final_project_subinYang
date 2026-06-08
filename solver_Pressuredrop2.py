@@ -5,7 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from CoolProp.CoolProp import PropsSI
 
-FLIP_PLOT_LEFT_RIGHT = True
+FLIP_PLOT_LEFT_RIGHT = False
 
 
 # ============================================================
@@ -32,6 +32,22 @@ def shah_boiling_correlation(h_l, q_flux, G, h_fg, quality):
     )
 
     return h_l * enhancement
+
+
+def bergles_rohsenow_onb_deltaT(q_flux, P_cold):
+    """
+    Bergles and Rohsenow (1964) ONB wall superheat [K].
+
+    P_cold is provided in Pa and converted to bar.
+    q_flux is local heat flux [W/m2].
+    """
+
+    q_flux = max(q_flux, 1.0)
+    P_bar = max(P_cold / 1.0e5, 1.0e-12)
+    n = 0.463 * P_bar**0.0234
+    deltaT_onb = 0.556 * (q_flux / (1082.0 * P_bar**1.156))**n
+
+    return deltaT_onb
 
 
 # ============================================================
@@ -176,6 +192,26 @@ def get_cold_heat_transfer_coefficient(
         )
         correlation = "Dittus-Boelter liquid"
 
+    elif phase == "subcooled_boiling":
+
+        h_l = dittus_boelter(
+            Re=Re_c,
+            Pr=Pr_c,
+            k=k_c,
+            Dh=D_inner,
+            heating=True
+        )
+
+        h_cold = shah_boiling_correlation(
+            h_l=h_l,
+            q_flux=q_flux,
+            G=G_cold,
+            h_fg=H_fg,
+            quality=1.0e-6
+        )
+
+        correlation = "Subcooled boiling after ONB"
+
     elif phase == "boiling":
 
         h_l = dittus_boelter(
@@ -218,6 +254,46 @@ def get_cold_heat_transfer_coefficient(
         correlation = "Dittus-Boelter"
 
     return h_cold, correlation
+
+
+def calc_wall_temperatures(
+    T_hot_bulk,
+    T_cold_bulk,
+    q_flux,
+    h_hot,
+    h_cold
+):
+    """
+    Local wall surface temperatures [K].
+
+    q_flux is the local heat flux [W/m2]. The heat flows from hot fluid to
+    cold fluid, so the hot-side wall is cooler than hot bulk fluid and the
+    cold-side wall is hotter than cold bulk fluid.
+    """
+
+    h_hot = max(h_hot, 1.0e-12)
+    h_cold = max(h_cold, 1.0e-12)
+
+    T_wall_hot = T_hot_bulk - q_flux / h_hot
+    T_wall_cold = T_cold_bulk + q_flux / h_cold
+
+    return T_wall_hot, T_wall_cold
+
+
+def cell_values_to_node_values(cell_values):
+    """
+    Convert cell-centered values to node values by endpoint copy and
+    interior averaging.
+    """
+
+    node_values = np.zeros(N + 1)
+    node_values[0] = cell_values[0]
+    node_values[-1] = cell_values[-1]
+
+    if N > 1:
+        node_values[1:-1] = 0.5 * (cell_values[:-1] + cell_values[1:])
+
+    return node_values
 
 
 # ============================================================
@@ -273,6 +349,13 @@ h_cold_arr = np.zeros(N)
 U_arr = np.zeros(N)
 q_arr = np.zeros(N)
 q_flux_arr = np.zeros(N)
+T_wall_hot_cell = np.zeros(N)
+T_wall_cold_cell = np.zeros(N)
+R_wall_cell = np.zeros(N)
+T_sat_cell = np.zeros(N)
+DeltaT_actual_cell = np.zeros(N)
+DeltaT_ONB_cell = np.zeros(N)
+cold_region = [""] * N
 
 dpdz_hot_arr = np.zeros(N)
 dpdz_cold_arr = np.zeros(N)
@@ -292,11 +375,11 @@ pressure_correlation = [""] * N
 # Initial conditions
 # ============================================================
 
-T_hot[0] = T_hot_in
-H_hot[0] = PropsSI("H", "P", P_hot, "T", T_hot_in, fluid_hot)
+T_hot[N] = T_hot_in
+H_hot[N] = PropsSI("H", "P", P_hot, "T", T_hot_in, fluid_hot)
 
-T_cold[N] = T_cold_in
-H_cold[N] = PropsSI("H", "P", P_cold, "T", T_cold_in, fluid_cold)
+T_cold[0] = T_cold_in
+H_cold[0] = PropsSI("H", "P", P_cold, "T", T_cold_in, fluid_cold)
 
 
 # ============================================================
@@ -316,6 +399,8 @@ mu_g_sat = PropsSI("V", "P", P_cold, "Q", 1, fluid_cold)
 
 G_hot = m_dot_hot / A_flow
 G_cold = m_dot_cold / A_flow
+x_onb = None
+onb_started = False
 
 
 # ============================================================
@@ -324,8 +409,8 @@ G_cold = m_dot_cold / A_flow
 
 for i in range(N):
 
-    ih = i
-    ic = N - i
+    ih = N - i
+    ic = i
 
     # -----------------------------
     # Hot side
@@ -434,6 +519,64 @@ for i in range(N):
             q = U * P_heat * dx * dT
             q_flux_local = q / (P_heat * dx)
 
+    T_wall_hot_local, T_wall_cold_local = calc_wall_temperatures(
+        T_hot_bulk=T_hot[ih],
+        T_cold_bulk=T_cold[ic],
+        q_flux=q_flux_local,
+        h_hot=h_hot,
+        h_cold=h_cold
+    )
+    DeltaT_actual = T_wall_cold_local - T_sat
+    DeltaT_ONB = bergles_rohsenow_onb_deltaT(q_flux_local, P_cold)
+
+    if phase[ic] == "subcooled":
+        if (not onb_started) and DeltaT_actual >= DeltaT_ONB:
+            onb_started = True
+            x_onb = x[ic]
+
+        if onb_started:
+            h_cold, corr_name = get_cold_heat_transfer_coefficient(
+                phase="subcooled_boiling",
+                Re_c=Re_c,
+                Pr_c=Pr_c,
+                k_c=k_c,
+                D_inner=D_inner,
+                q_flux=q_flux_local,
+                G_cold=G_cold,
+                H_fg=H_fg,
+                quality_local=0.0
+            )
+
+            U = 1.0 / (
+                1.0 / h_hot
+                + t_wall / k_wall
+                + 1.0 / h_cold
+            )
+
+            if dT <= 0.0:
+                q = 0.0
+                q_flux_local = 0.0
+            else:
+                q = U * P_heat * dx * dT
+                q_flux_local = q / (P_heat * dx)
+
+            T_wall_hot_local, T_wall_cold_local = calc_wall_temperatures(
+                T_hot_bulk=T_hot[ih],
+                T_cold_bulk=T_cold[ic],
+                q_flux=q_flux_local,
+                h_hot=h_hot,
+                h_cold=h_cold
+            )
+            DeltaT_actual = T_wall_cold_local - T_sat
+            DeltaT_ONB = bergles_rohsenow_onb_deltaT(q_flux_local, P_cold)
+            region_name = "Subcooled Boiling"
+        else:
+            region_name = "Single Phase Liquid"
+    elif phase[ic] == "boiling":
+        region_name = "Saturated Boiling"
+    else:
+        region_name = phase[ic]
+
     # -----------------------------
     # Cold-side pressure drop
     # -----------------------------
@@ -468,11 +611,26 @@ for i in range(N):
     # -----------------------------
     # Save cell results
     # -----------------------------
+    T_wall_hot_local, T_wall_cold_local = calc_wall_temperatures(
+        T_hot_bulk=T_hot[ih],
+        T_cold_bulk=T_cold[ic],
+        q_flux=q_flux_local,
+        h_hot=h_hot,
+        h_cold=h_cold
+    )
+
     h_hot_arr[i] = h_hot
     h_cold_arr[i] = h_cold
     U_arr[i] = U
     q_arr[i] = q
     q_flux_arr[i] = q_flux_local
+    T_wall_hot_cell[i] = T_wall_hot_local
+    T_wall_cold_cell[i] = T_wall_cold_local
+    R_wall_cell[i] = np.log(D_outer / D_inner) / (2.0 * np.pi * k_wall * dx)
+    T_sat_cell[i] = T_sat
+    DeltaT_actual_cell[i] = DeltaT_actual
+    DeltaT_ONB_cell[i] = DeltaT_ONB
+    cold_region[i] = region_name
 
     dpdz_hot_arr[i] = dpdz_hot
     dpdz_cold_arr[i] = dpdz_cold
@@ -489,8 +647,8 @@ for i in range(N):
     # -----------------------------
     # Update enthalpy
     # -----------------------------
-    H_hot[ih + 1] = H_hot[ih] - q / m_dot_hot
-    H_cold[ic - 1] = H_cold[ic] + q / m_dot_cold
+    H_hot[ih - 1] = H_hot[ih] - q / m_dot_hot
+    H_cold[ic + 1] = H_cold[ic] + q / m_dot_cold
 
 
 # ============================================================
@@ -519,17 +677,20 @@ for i in range(N + 1):
         T_sat
     )
 
+T_wall_hot = cell_values_to_node_values(T_wall_hot_cell)
+T_wall_cold = cell_values_to_node_values(T_wall_cold_cell)
+
 
 # ============================================================
 # Cumulative pressure drop
-# Cold water flows from x = L to x = 0
-# Therefore cumulative dP is accumulated from right to left.
+# Cold water flows from x = 0 to x = L.
+# Therefore cumulative dP is accumulated from left to right.
 # ============================================================
 
-dP_cold_cumulative[N] = 0.0
+dP_cold_cumulative[0] = 0.0
 
-for i in range(N - 1, -1, -1):
-    dP_cold_cumulative[i] = dP_cold_cumulative[i + 1] + dP_cold_cell[i]
+for i in range(N):
+    dP_cold_cumulative[i + 1] = dP_cold_cumulative[i] + dP_cold_cell[i]
 
 dP_cold_cumulative_cell[:] = dP_cold_cumulative[:-1]
 
@@ -542,6 +703,9 @@ df_node = pd.DataFrame({
     "x_m": x,
     "T_hot_C": T_hot - 273.15,
     "T_cold_C": T_cold - 273.15,
+    "T_wall_hot_C": T_wall_hot - 273.15,
+    "T_wall_cold_C": T_wall_cold - 273.15,
+    "T_sat_cold_C": np.full(N + 1, T_sat - 273.15),
     "cold_quality": quality,
     "cold_phase": phase,
     "cold_cumulative_dP_Pa": dP_cold_cumulative,
@@ -556,6 +720,15 @@ df_cell = pd.DataFrame({
     "U_W_m2K": U_arr,
     "q_W": q_arr,
     "q_flux_W_m2": q_flux_arr,
+    "T_wall_hot_C": T_wall_hot_cell - 273.15,
+    "T_wall_cold_C": T_wall_cold_cell - 273.15,
+    "T_sat": T_sat_cell - 273.15,
+    "T_wall": T_wall_cold_cell - 273.15,
+    "DeltaT_actual": DeltaT_actual_cell,
+    "DeltaT_ONB": DeltaT_ONB_cell,
+    "cold_region": cold_region,
+    "R_wall_K_W": R_wall_cell,
+    "wall_deltaT_conduction_C": q_arr * R_wall_cell,
     "dpdz_hot_Pa_m": dpdz_hot_arr,
     "dpdz_cold_Pa_m": dpdz_cold_arr,
     "dP_hot_cell_Pa": dP_hot_cell,
@@ -587,6 +760,19 @@ df_cell.to_csv(
 
 fig, ax1 = plt.subplots(figsize=(12, 6))
 
+subcooled_boiling_indices = np.where(
+    (T_wall_cold > T_sat)
+    & (np.array(phase) == "subcooled")
+)[0]
+subcooled_boiling_start_x = (
+    x[subcooled_boiling_indices[0]]
+    if subcooled_boiling_indices.size > 0
+    else None
+)
+
+chf_x = None
+dryout_x = None
+
 ax1.plot(
     x,
     T_hot - 273.15,
@@ -605,6 +791,26 @@ ax1.plot(
     label="Cold water / steam temperature"
 )
 
+ax1.plot(
+    x,
+    T_wall_hot - 273.15,
+    linewidth=2.4,
+    linestyle="--",
+    marker="^",
+    markersize=3,
+    label="Hot-side wall temperature"
+)
+
+ax1.plot(
+    x,
+    T_wall_cold - 273.15,
+    linewidth=2.4,
+    linestyle="--",
+    marker="v",
+    markersize=3,
+    label="Cold-side wall temperature"
+)
+
 ax1.axhline(
     T_sat - 273.15,
     linestyle="--",
@@ -620,6 +826,42 @@ if boiling_indices.size > 0:
         x[boiling_indices[-1]],
         alpha=0.18,
         label="Boiling region"
+    )
+
+if subcooled_boiling_start_x is not None:
+    ax1.axvline(
+        subcooled_boiling_start_x,
+        color="tab:green",
+        linestyle=":",
+        linewidth=2.0,
+        label="Cold wall exceeds Tsat"
+    )
+
+if x_onb is not None:
+    ax1.axvline(
+        x_onb,
+        color="tab:orange",
+        linestyle=":",
+        linewidth=2.4,
+        label="ONB start: Bergles-Rohsenow"
+    )
+
+if chf_x is not None:
+    ax1.axvline(
+        chf_x,
+        color="tab:red",
+        linestyle=":",
+        linewidth=2.0,
+        label="CHF location"
+    )
+
+if dryout_x is not None:
+    ax1.axvline(
+        dryout_x,
+        color="tab:purple",
+        linestyle=":",
+        linewidth=2.0,
+        label="Dryout start"
     )
 
 if FLIP_PLOT_LEFT_RIGHT:
@@ -676,24 +918,39 @@ print("Steam Generator Results")
 print("==============================")
 
 print("[Direction]")
-print("Hot water  : left  -> right")
-print("Cold water : right -> left")
+print("Cold water : left  -> right")
+print("Hot water  : right -> left")
 
 print("\n[Temperature]")
-print(f"Hot inlet  at x = 0 : {T_hot[0] - 273.15:.2f} °C")
-print(f"Hot outlet at x = L : {T_hot[-1] - 273.15:.2f} °C")
-print(f"Cold inlet  at x = L : {T_cold[-1] - 273.15:.2f} °C")
-print(f"Cold outlet at x = 0 : {T_cold[0] - 273.15:.2f} °C")
+print(f"Hot inlet  at x = L : {T_hot[-1] - 273.15:.2f} degC")
+print(f"Hot outlet at x = 0 : {T_hot[0] - 273.15:.2f} degC")
+print(f"Cold inlet  at x = 0 : {T_cold[0] - 273.15:.2f} degC")
+print(f"Cold outlet at x = L : {T_cold[-1] - 273.15:.2f} degC")
+print(f"Max hot-side wall temperature : {np.max(T_wall_hot) - 273.15:.2f} degC")
+print(f"Max cold-side wall temperature : {np.max(T_wall_cold) - 273.15:.2f} degC")
+
+if subcooled_boiling_start_x is not None:
+    print(
+        "Cold-side wall first exceeds Tsat "
+        f"at x = {subcooled_boiling_start_x:.3f} m"
+    )
+else:
+    print("Cold-side wall does not exceed Tsat in subcooled nodes.")
+
+if x_onb is not None:
+    print(f"ONB starts by Bergles-Rohsenow criterion at x = {x_onb:.3f} m")
+else:
+    print("ONB not detected by Bergles-Rohsenow criterion.")
 
 print("\n[Cold-side phase change]")
 print(f"T_sat at P_cold = {P_cold / 1e6:.2f} MPa : {T_sat - 273.15:.2f} °C")
 print(f"Latent heat H_fg : {H_fg / 1e3:.2f} kJ/kg")
-print(f"Cold outlet quality at x = 0 : {quality[0]:.3f}")
-print(f"Cold outlet phase : {phase[0]}")
+print(f"Cold outlet quality at x = L : {quality[-1]:.3f}")
+print(f"Cold outlet phase : {phase[-1]}")
 
 print("\n[Pressure drop]")
 print(f"Pressure drop model in boiling region : {pressure_drop_model}")
-print(f"Total cold-side pressure drop : {dP_cold_cumulative[0] / 1000.0:.3f} kPa")
+print(f"Total cold-side pressure drop : {dP_cold_cumulative[-1] / 1000.0:.3f} kPa")
 print(f"Total hot-side pressure drop  : {np.sum(dP_hot_cell) / 1000.0:.3f} kPa")
 
 print("\n[Cold-side heat transfer correlation]")

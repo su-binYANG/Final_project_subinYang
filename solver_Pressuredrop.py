@@ -9,6 +9,13 @@ from pathlib import Path
 from CoolProp.CoolProp import PropsSI
 
 FLIP_PLOT_LEFT_RIGHT = True
+DEBUG_COLD_ENTHALPY = True
+MIN_COLD_M_DOT = 0.01
+OUTLET_ERROR_ON_FAILURE = 1.0e9
+MAX_REASONABLE_COLD_H = 6.0e6
+save_fig_only = True
+save_individual_figures = False
+enable_interactive_sliders = False
 
 
 def save_csv_with_fallback(df, filename, **kwargs):
@@ -30,6 +37,49 @@ def save_csv_with_fallback(df, filename, **kwargs):
 # ============================================================
 # Correlations
 # ============================================================
+
+def log_cold_enthalpy_trace(label, H_cold_mid, dQ, m_dot_cold, P_cold_local):
+    if not DEBUG_COLD_ENTHALPY:
+        return
+
+    dH = dQ / max(m_dot_cold, 1.0e-12)
+    print(
+        f"[Cold enthalpy trace] {label}: "
+        f"H_cold_mid={H_cold_mid:.3f} J/kg, "
+        f"dQ={dQ:.3f} W, "
+        f"m_dot_cold={m_dot_cold:.6f} kg/s, "
+        f"dH=dQ/m_dot={dH:.3f} J/kg, "
+        f"P_cold_local={P_cold_local:.3f} Pa"
+    )
+
+
+def validate_cold_enthalpy(Hc, P_cold, context="cold state"):
+    if not np.isfinite(Hc):
+        raise ValueError(
+            f"{context}: non-finite cold-side enthalpy H={Hc} J/kg "
+            f"at P={P_cold:.3f} Pa."
+        )
+
+    if Hc > MAX_REASONABLE_COLD_H:
+        raise ValueError(
+            f"{context}: cold-side enthalpy is too high for this model "
+            f"(H={Hc:.3f} J/kg, limit={MAX_REASONABLE_COLD_H:.3f} J/kg, "
+            f"P={P_cold:.3f} Pa). This usually means dQ/m_dot_cold became "
+            "too large because the trial m_dot_cold is too small."
+        )
+
+
+def print_figure_diagnostics(stage):
+    fig_nums = plt.get_fignums()
+    print(f"[Figure diagnostics] {stage}: {len(fig_nums)} figure(s), ids={fig_nums}")
+
+    for fig_num in fig_nums:
+        fig = plt.figure(fig_num)
+        print(
+            f"[Figure diagnostics] figure {fig_num}: "
+            f"{len(fig.axes)} axes"
+        )
+
 
 def dittus_boelter(Re, Pr, k, Dh, heating=True):
     """
@@ -76,6 +126,49 @@ def shah_boiling_correlation(h_l, q_flux, G, h_fg, quality):
     h_tp = h_l * enhancement
 
     return h_tp
+
+
+def calc_xdi_del_col(
+    q_flux,
+    G,
+    Dh,
+    h_fg,
+    rho_l,
+    rho_g,
+    sigma,
+    Pr_l
+):
+    """
+    Del Col et al. (2010) dryout incipience quality x_di.
+    """
+
+    q_flux = max(q_flux, 1.0e-12)
+    G = max(G, 1.0e-12)
+    Dh = max(Dh, 1.0e-12)
+    h_fg = max(h_fg, 1.0e-12)
+    rho_l = max(rho_l, 1.0e-12)
+    rho_g = max(rho_g, 1.0e-12)
+    sigma = max(sigma, 1.0e-12)
+    Pr_l_term = max(1.0 - Pr_l, 1.0e-12)
+
+    Bo = q_flux / (G * h_fg)
+
+    RLL = (
+        0.437
+        * (rho_g / rho_l) ** 0.073
+        * (rho_l * sigma / G**2) ** 0.24
+        * (Dh**0.721 / Bo)
+    ) ** (1.0 / 0.96)
+
+    x_di = (
+        0.4695
+        * ((4.0 * q_flux * RLL) / (G * Dh * h_fg)) ** 1.472
+        * ((G**2 * Dh) / (rho_l * sigma)) ** 0.3024
+        * (Dh / 0.001) ** 0.1836
+        * Pr_l_term ** 1.239
+    )
+
+    return x_di, RLL, Bo
 
 
 def friction_factor_darcy(Re):
@@ -130,42 +223,72 @@ def get_saturation_props(P, fluid):
     return T_sat, H_f, H_g, H_fg
 
 
-def get_cold_state(Hc, P_cold, fluid_cold):
+def get_cold_dryout_inputs(P_cold, fluid_cold, G_cold, Dh):
+    rho_l = PropsSI("D", "P", P_cold, "Q", 0, fluid_cold)
+    rho_g = PropsSI("D", "P", P_cold, "Q", 1, fluid_cold)
+    mu_l = PropsSI("V", "P", P_cold, "Q", 0, fluid_cold)
+    mu_g = PropsSI("V", "P", P_cold, "Q", 1, fluid_cold)
+    k_l = PropsSI("L", "P", P_cold, "Q", 0, fluid_cold)
+    k_g = PropsSI("L", "P", P_cold, "Q", 1, fluid_cold)
+    cp_l = PropsSI("C", "P", P_cold, "Q", 0, fluid_cold)
+    cp_g = PropsSI("C", "P", P_cold, "Q", 1, fluid_cold)
+    sigma = PropsSI("I", "P", P_cold, "Q", 0, fluid_cold)
 
-    T_sat, H_f, H_g, H_fg = get_saturation_props(P_cold, fluid_cold)
+    return {
+        "rho_l": rho_l,
+        "rho_g": rho_g,
+        "sigma": sigma,
+        "Pr_l": cp_l * mu_l / k_l,
+        "Re_vapor": G_cold * Dh / mu_g,
+        "Pr_vapor": cp_g * mu_g / k_g,
+        "k_vapor": k_g,
+    }
 
-    if Hc < H_f:
 
-        T = PropsSI("T", "P", P_cold, "H", Hc, fluid_cold)
-        quality = 0.0
-        phase = "subcooled"
+def get_cold_state(Hc, P_cold, fluid_cold, context="cold state"):
 
-        rho = PropsSI("D", "P", P_cold, "H", Hc, fluid_cold)
-        mu = PropsSI("V", "P", P_cold, "H", Hc, fluid_cold)
-        k = PropsSI("L", "P", P_cold, "H", Hc, fluid_cold)
-        cp = PropsSI("C", "P", P_cold, "H", Hc, fluid_cold)
+    validate_cold_enthalpy(Hc, P_cold, context=context)
 
-    elif H_f <= Hc <= H_g:
+    try:
+        T_sat, H_f, H_g, H_fg = get_saturation_props(P_cold, fluid_cold)
 
-        T = T_sat
-        quality = (Hc - H_f) / H_fg
-        phase = "boiling"
+        if Hc < H_f:
 
-        rho = PropsSI("D", "P", P_cold, "Q", 0, fluid_cold)
-        mu = PropsSI("V", "P", P_cold, "Q", 0, fluid_cold)
-        k = PropsSI("L", "P", P_cold, "Q", 0, fluid_cold)
-        cp = PropsSI("C", "P", P_cold, "Q", 0, fluid_cold)
+            T = PropsSI("T", "P", P_cold, "H", Hc, fluid_cold)
+            quality = 0.0
+            phase = "subcooled"
 
-    else:
+            rho = PropsSI("D", "P", P_cold, "H", Hc, fluid_cold)
+            mu = PropsSI("V", "P", P_cold, "H", Hc, fluid_cold)
+            k = PropsSI("L", "P", P_cold, "H", Hc, fluid_cold)
+            cp = PropsSI("C", "P", P_cold, "H", Hc, fluid_cold)
 
-        T = PropsSI("T", "P", P_cold, "H", Hc, fluid_cold)
-        quality = 1.0
-        phase = "superheated_vapor"
+        elif H_f <= Hc <= H_g:
 
-        rho = PropsSI("D", "P", P_cold, "H", Hc, fluid_cold)
-        mu = PropsSI("V", "P", P_cold, "H", Hc, fluid_cold)
-        k = PropsSI("L", "P", P_cold, "H", Hc, fluid_cold)
-        cp = PropsSI("C", "P", P_cold, "H", Hc, fluid_cold)
+            T = T_sat
+            quality = (Hc - H_f) / H_fg
+            phase = "boiling"
+
+            rho = PropsSI("D", "P", P_cold, "Q", 0, fluid_cold)
+            mu = PropsSI("V", "P", P_cold, "Q", 0, fluid_cold)
+            k = PropsSI("L", "P", P_cold, "Q", 0, fluid_cold)
+            cp = PropsSI("C", "P", P_cold, "Q", 0, fluid_cold)
+
+        else:
+
+            T = PropsSI("T", "P", P_cold, "H", Hc, fluid_cold)
+            quality = 1.0
+            phase = "superheated_vapor"
+
+            rho = PropsSI("D", "P", P_cold, "H", Hc, fluid_cold)
+            mu = PropsSI("V", "P", P_cold, "H", Hc, fluid_cold)
+            k = PropsSI("L", "P", P_cold, "H", Hc, fluid_cold)
+            cp = PropsSI("C", "P", P_cold, "H", Hc, fluid_cold)
+    except ValueError as exc:
+        raise ValueError(
+            f"{context}: CoolProp failed for cold-side state "
+            f"(P={P_cold:.3f} Pa, H={Hc:.3f} J/kg): {exc}"
+        ) from exc
 
     return T, quality, phase, rho, mu, k, cp, T_sat, H_f, H_g, H_fg
 
@@ -286,13 +409,21 @@ def get_cold_heat_transfer_coefficient(
     q_flux,
     G_cold,
     H_fg,
-    quality_local
+    quality_local,
+    rho_l=None,
+    rho_g=None,
+    sigma=None,
+    Pr_l=None,
+    Re_vapor=None,
+    Pr_vapor=None,
+    k_vapor=None
 ):
     """
     Cold-side heat transfer coefficient by phase.
 
     subcooled liquid  : Dittus-Boelter
-    boiling region    : Shah-type boiling correlation
+    boiling region    : Shah-type boiling correlation before dryout
+    dryout region     : Dittus-Boelter vapor after Del Col x_di
     superheated vapor : Dittus-Boelter
     """
 
@@ -318,15 +449,51 @@ def get_cold_heat_transfer_coefficient(
             heating=True
         )
 
-        h_cold = shah_boiling_correlation(
-            h_l=h_l,
-            q_flux=q_flux,
-            G=G_cold,
-            h_fg=H_fg,
-            quality=quality_local
+        has_dryout_inputs = all(
+            value is not None
+            for value in (rho_l, rho_g, sigma, Pr_l, Re_vapor, Pr_vapor, k_vapor)
         )
 
-        correlation = "Shah boiling"
+        if has_dryout_inputs:
+            x_di, RLL, Bo = calc_xdi_del_col(
+                q_flux=q_flux,
+                G=G_cold,
+                Dh=D_inner,
+                h_fg=H_fg,
+                rho_l=rho_l,
+                rho_g=rho_g,
+                sigma=sigma,
+                Pr_l=Pr_l
+            )
+
+            if quality_local < x_di:
+                h_cold = shah_boiling_correlation(
+                    h_l=h_l,
+                    q_flux=q_flux,
+                    G=G_cold,
+                    h_fg=H_fg,
+                    quality=quality_local
+                )
+                correlation = f"Shah boiling before dryout (x_di={x_di:.4f})"
+            else:
+                h_cold = dittus_boelter(
+                    Re=Re_vapor,
+                    Pr=Pr_vapor,
+                    k=k_vapor,
+                    Dh=D_inner,
+                    heating=True
+                )
+                correlation = f"Del Col dryout vapor (x_di={x_di:.4f})"
+        else:
+            h_cold = shah_boiling_correlation(
+                h_l=h_l,
+                q_flux=q_flux,
+                G=G_cold,
+                h_fg=H_fg,
+                quality=quality_local
+            )
+
+            correlation = "Shah boiling"
 
     elif phase == "superheated_vapor":
 
@@ -355,6 +522,22 @@ def get_cold_heat_transfer_coefficient(
     return h_cold, correlation
 
 
+def calc_wall_temperatures(T_hot_bulk, T_cold_bulk, q_flux, h_hot, h_cold):
+    """
+    Wall surface temperatures from the same thermal-resistance model used for U.
+    Returns hot-side wall, cold-side wall, and mean wall temperature [K].
+    """
+
+    h_hot = max(h_hot, 1.0e-12)
+    h_cold = max(h_cold, 1.0e-12)
+
+    T_wall_hot_side = T_hot_bulk - q_flux / h_hot
+    T_wall_cold_side = T_cold_bulk + q_flux / h_cold
+    T_wall_mean = 0.5 * (T_wall_hot_side + T_wall_cold_side)
+
+    return T_wall_hot_side, T_wall_cold_side, T_wall_mean
+
+
 # ============================================================
 # Geometry
 # ============================================================
@@ -371,6 +554,8 @@ P_heat = np.pi * D_inner
 
 t_wall = (D_outer - D_inner) / 2.0
 k_wall = 16.0
+
+x = np.linspace(0.0, L, N + 1)
 
 
 # ============================================================
@@ -394,10 +579,12 @@ m_dot_hot = rho_hot_in * A_flow * V_hot_in
 fluid_cold = "Water"
 
 m_dot_cold = 0.1
-P_cold_in = 6e6
+P_cold_in = 7e6
 
 T_cold_in_C = 280.0
 T_cold_in = T_cold_in_C + 273.15
+target_cold_outlet_T_C = 290.0
+auto_tune_cold_m_dot = True
 
 cold_two_phase_dp_model = "Mishima-Hibiki"
 cold_channel_shape = "circular"
@@ -426,6 +613,9 @@ def calculate_case(m_dot_cold_case, P_cold_in_case, T_cold_in_C_case):
     U_case = np.zeros(N)
     q_case = np.zeros(N)
     q_flux_case = np.zeros(N)
+    T_wall_hot_side_case = np.zeros(N)
+    T_wall_cold_side_case = np.zeros(N)
+    T_wall_mean_case = np.zeros(N)
     cold_correlation_case = [""] * N
     cold_temperature_change_case = [""] * N
 
@@ -500,6 +690,11 @@ def calculate_case(m_dot_cold_case, P_cold_in_case, T_cold_in_C_case):
         Re_c = rho_c * V_c * D_inner / mu_c
         Pr_c = cp_c * mu_c / k_c
         f_cold_local = friction_factor(Re_c)
+        dryout_inputs = (
+            get_cold_dryout_inputs(P_cold_local, fluid_cold, G_cold_case, D_inner)
+            if phase_case[ic] == "boiling"
+            else {}
+        )
 
         h_cold_local, corr_name = get_cold_heat_transfer_coefficient(
             phase=phase_case[ic],
@@ -510,7 +705,8 @@ def calculate_case(m_dot_cold_case, P_cold_in_case, T_cold_in_C_case):
             q_flux=50000.0,
             G_cold=G_cold_case,
             H_fg=H_fg_cold_case[ic],
-            quality_local=quality_case[ic]
+            quality_local=quality_case[ic],
+            **dryout_inputs
         )
 
         U_local = 1.0 / (1.0 / h_hot_local + t_wall / k_wall + 1.0 / h_cold_local)
@@ -537,6 +733,13 @@ def calculate_case(m_dot_cold_case, P_cold_in_case, T_cold_in_C_case):
 
             if needs_two_phase_recalc:
                 H_cold_mid = 0.5 * (H_cold_case[ic] + H_cold_out_guess)
+                log_cold_enthalpy_trace(
+                    label=f"calculate_case cell={i} mid-cell h recalc",
+                    H_cold_mid=H_cold_mid,
+                    dQ=q_local,
+                    m_dot_cold=m_dot_cold_case,
+                    P_cold_local=P_cold_local
+                )
                 (
                     _T_cold_mid,
                     quality_mid,
@@ -549,7 +752,12 @@ def calculate_case(m_dot_cold_case, P_cold_in_case, T_cold_in_C_case):
                     _H_f_mid,
                     _H_g_mid,
                     H_fg_mid
-                ) = get_cold_state(H_cold_mid, P_cold_local, fluid_cold)
+                ) = get_cold_state(
+                    H_cold_mid,
+                    P_cold_local,
+                    fluid_cold,
+                    context=f"calculate_case cell={i} H_cold_mid"
+                )
 
                 V_c_mid = m_dot_cold_case / (rho_c_mid * A_flow)
                 Re_c_mid = rho_c_mid * V_c_mid * D_inner / mu_c_mid
@@ -562,6 +770,11 @@ def calculate_case(m_dot_cold_case, P_cold_in_case, T_cold_in_C_case):
                     )
                     else phase_mid
                 )
+                dryout_inputs_mid = (
+                    get_cold_dryout_inputs(P_cold_local, fluid_cold, G_cold_case, D_inner)
+                    if phase_for_h == "boiling"
+                    else {}
+                )
 
                 h_cold_local, corr_name = get_cold_heat_transfer_coefficient(
                     phase=phase_for_h,
@@ -572,7 +785,8 @@ def calculate_case(m_dot_cold_case, P_cold_in_case, T_cold_in_C_case):
                     q_flux=q_flux_local,
                     G_cold=G_cold_case,
                     H_fg=H_fg_mid,
-                    quality_local=quality_mid
+                    quality_local=quality_mid,
+                    **dryout_inputs_mid
                 )
 
                 U_local = 1.0 / (
@@ -582,6 +796,18 @@ def calculate_case(m_dot_cold_case, P_cold_in_case, T_cold_in_C_case):
                 )
                 q_local = U_local * P_heat * dx * dT
                 q_flux_local = q_local / (P_heat * dx)
+
+        (
+            T_wall_hot_side_case[i],
+            T_wall_cold_side_case[i],
+            T_wall_mean_case[i]
+        ) = calc_wall_temperatures(
+            T_hot_bulk=T_hot_case[ih],
+            T_cold_bulk=T_cold_case[ic],
+            q_flux=q_flux_local,
+            h_hot=h_hot_local,
+            h_cold=h_cold_local
+        )
 
         h_hot_case[i] = h_hot_local
         h_cold_case[i] = h_cold_local
@@ -741,6 +967,9 @@ def calculate_case(m_dot_cold_case, P_cold_in_case, T_cold_in_C_case):
         "T_cold_C": T_cold_case - 273.15,
         "T_cold_plot_C": T_cold_plot_C_case,
         "T_sat_cold_C": T_sat_cold_case - 273.15,
+        "T_wall_hot_side_C": T_wall_hot_side_case - 273.15,
+        "T_wall_cold_side_C": T_wall_cold_side_case - 273.15,
+        "T_wall_mean_C": T_wall_mean_case - 273.15,
         "hot_cumulative_dP": hot_cumulative_dP_case,
         "cold_cumulative_dP_from_inlet": cold_cumulative_dP_from_inlet_case,
         "phase_arr": phase_arr_case,
@@ -750,11 +979,104 @@ def calculate_case(m_dot_cold_case, P_cold_in_case, T_cold_in_C_case):
     }
 
 
+def find_cold_m_dot_for_outlet_temperature(
+    target_T_cold_out_C,
+    P_cold_in_case,
+    T_cold_in_C_case,
+    m_dot_min=MIN_COLD_M_DOT,
+    m_dot_max=1.0,
+    tolerance_C=0.02,
+    max_iter=40
+):
+    """
+    Find cold-side mass flow rate that gives the target cold outlet temperature.
+    Lower cold mass flow generally gives a hotter outlet, so bisection is used.
+    """
+
+    def outlet_error(m_dot_trial):
+        if m_dot_trial < MIN_COLD_M_DOT:
+            print(
+                "[Auto tune] Excluding trial because m_dot_cold is below "
+                f"minimum: {m_dot_trial:.6f} kg/s < {MIN_COLD_M_DOT:.6f} kg/s"
+            )
+            return OUTLET_ERROR_ON_FAILURE
+
+        try:
+            result = calculate_case(
+                m_dot_cold_case=m_dot_trial,
+                P_cold_in_case=P_cold_in_case,
+                T_cold_in_C_case=T_cold_in_C_case
+            )
+        except ValueError as exc:
+            print(
+                "[Auto tune] Excluding trial m_dot_cold="
+                f"{m_dot_trial:.6f} kg/s due to property/enthalpy error: {exc}"
+            )
+            return OUTLET_ERROR_ON_FAILURE
+
+        return result["T_cold_C"][0] - target_T_cold_out_C
+
+    low = max(m_dot_min, MIN_COLD_M_DOT)
+    high = m_dot_max
+    err_low = outlet_error(low)
+    err_high = outlet_error(high)
+
+    for _ in range(12):
+        if err_low * err_high <= 0.0:
+            break
+
+        if err_low < 0.0 and err_high < 0.0:
+            if low <= MIN_COLD_M_DOT:
+                break
+
+            low = max(MIN_COLD_M_DOT, low * 0.5)
+            err_low = outlet_error(low)
+        else:
+            high *= 2.0
+            err_high = outlet_error(high)
+    else:
+        closest_m_dot = low if abs(err_low) < abs(err_high) else high
+        closest_error = err_low if abs(err_low) < abs(err_high) else err_high
+        print(
+            "[Warning] Could not bracket target cold outlet temperature. "
+            f"Using closest m_dot_cold = {closest_m_dot:.5f} kg/s "
+            f"(outlet error = {closest_error:.3f} degC)."
+        )
+        return closest_m_dot
+
+    for _ in range(max_iter):
+        mid = 0.5 * (low + high)
+        err_mid = outlet_error(mid)
+
+        if abs(err_mid) <= tolerance_C:
+            return mid
+
+        if err_low * err_mid <= 0.0:
+            high = mid
+            err_high = err_mid
+        else:
+            low = mid
+            err_low = err_mid
+
+    return 0.5 * (low + high)
+
+
+if auto_tune_cold_m_dot:
+    m_dot_cold = find_cold_m_dot_for_outlet_temperature(
+        target_T_cold_out_C=target_cold_outlet_T_C,
+        P_cold_in_case=P_cold_in,
+        T_cold_in_C_case=T_cold_in_C
+    )
+    print(
+        "[Auto tune] "
+        f"m_dot_cold adjusted to {m_dot_cold:.5f} kg/s "
+        f"for target cold outlet temperature {target_cold_outlet_T_C:.2f} degC."
+    )
+
+
 # ============================================================
 # Arrays
 # ============================================================
-
-x = np.linspace(0.0, L, N + 1)
 
 T_hot = np.zeros(N + 1)
 H_hot = np.zeros(N + 1)
@@ -772,6 +1094,9 @@ h_cold_arr = np.zeros(N)
 U_arr = np.zeros(N)
 q_arr = np.zeros(N)
 q_flux_arr = np.zeros(N)
+T_wall_hot_side_arr = np.zeros(N)
+T_wall_cold_side_arr = np.zeros(N)
+T_wall_mean_arr = np.zeros(N)
 cold_correlation = [""] * N
 cold_temperature_change = [""] * N
 
@@ -909,6 +1234,11 @@ for i in range(N):
     Re_c = rho_c * V_c * D_inner / mu_c
     Pr_c = cp_c * mu_c / k_c
     f_cold = friction_factor(Re_c)
+    dryout_inputs = (
+        get_cold_dryout_inputs(P_cold_local, fluid_cold, G_cold, D_inner)
+        if phase[ic] == "boiling"
+        else {}
+    )
 
     # =====================================================
     # First estimate of cold-side h
@@ -925,7 +1255,8 @@ for i in range(N):
         q_flux=q_flux_guess,
         G_cold=G_cold,
         H_fg=H_fg_cold[ic],
-        quality_local=quality[ic]
+        quality_local=quality[ic],
+        **dryout_inputs
     )
 
     # =====================================================
@@ -974,6 +1305,13 @@ for i in range(N):
         if needs_two_phase_recalc:
 
             H_cold_mid = 0.5 * (H_cold[ic] + H_cold_out_guess)
+            log_cold_enthalpy_trace(
+                label=f"main loop cell={i} mid-cell h recalc",
+                H_cold_mid=H_cold_mid,
+                dQ=q,
+                m_dot_cold=m_dot_cold,
+                P_cold_local=P_cold_local
+            )
 
             (
                 T_cold_mid,
@@ -990,7 +1328,8 @@ for i in range(N):
             ) = get_cold_state(
                 H_cold_mid,
                 P_cold_local,
-                fluid_cold
+                fluid_cold,
+                context=f"main loop cell={i} H_cold_mid"
             )
 
             V_c_mid = m_dot_cold / (rho_c_mid * A_flow)
@@ -1004,6 +1343,11 @@ for i in range(N):
                 )
                 else phase_mid
             )
+            dryout_inputs_mid = (
+                get_cold_dryout_inputs(P_cold_local, fluid_cold, G_cold, D_inner)
+                if phase_for_h == "boiling"
+                else {}
+            )
 
             h_cold, corr_name = get_cold_heat_transfer_coefficient(
                 phase=phase_for_h,
@@ -1014,7 +1358,8 @@ for i in range(N):
                 q_flux=q_flux_local,
                 G_cold=G_cold,
                 H_fg=H_fg_mid,
-                quality_local=quality_mid
+                quality_local=quality_mid,
+                **dryout_inputs_mid
             )
 
             U = 1.0 / (
@@ -1029,6 +1374,18 @@ for i in range(N):
     # =====================================================
     # Save cell results
     # =====================================================
+
+    (
+        T_wall_hot_side_arr[i],
+        T_wall_cold_side_arr[i],
+        T_wall_mean_arr[i]
+    ) = calc_wall_temperatures(
+        T_hot_bulk=T_hot[ih],
+        T_cold_bulk=T_cold[ic],
+        q_flux=q_flux_local,
+        h_hot=h_hot,
+        h_cold=h_cold
+    )
 
     h_hot_arr[i] = h_hot
     h_cold_arr[i] = h_cold
@@ -1204,6 +1561,9 @@ df_cell = pd.DataFrame({
     "U_W_m2K": U_arr,
     "q_W": q_arr,
     "q_flux_W_m2": q_flux_arr,
+    "T_wall_hot_side_C": T_wall_hot_side_arr - 273.15,
+    "T_wall_cold_side_C": T_wall_cold_side_arr - 273.15,
+    "T_wall_mean_C": T_wall_mean_arr - 273.15,
     "dP_hot_Pa": dP_hot_arr,
     "dpdz_cold_Pa_m": dpdz_cold_arr,
     "dP_cold_cell_Pa": dP_cold_arr,
@@ -1245,6 +1605,8 @@ print(df_cell)
 
 hot_cumulative_dP = (P_hot[0] - P_hot) / 1e3
 cold_cumulative_dP_from_inlet = (P_cold[-1] - P_cold) / 1e3
+cell_x_hot_mid = 0.5 * (x[:-1] + x[1:])
+cell_x_cold_mid = 0.5 * (x[N - np.arange(N)] + x[N - np.arange(N) - 1])
 cold_temperature_change_counts = pd.Series(cold_temperature_change).value_counts()
 cold_temperature_change_text = "\n".join(
     f"- {mode}: {count}"
@@ -1434,7 +1796,144 @@ ax_temp.grid(True, linestyle="--", alpha=0.5)
 lines = [line_hot, line_cold, line_sat]
 labels = [line.get_label() for line in lines]
 ax_temp.legend(lines, labels, loc="best")
-plt.tight_layout()
+fig_temp.subplots_adjust(
+    left=0.06,
+    right=0.97,
+    top=0.90,
+    bottom=0.10,
+    wspace=0.28,
+    hspace=0.32
+)
+
+
+# ============================================================
+# Plot : temperature profile
+# ============================================================
+
+fig_profile, ax_profile = plt.subplots(figsize=(14, 7))
+
+line_profile_hot, = ax_profile.plot(
+    x,
+    T_hot - 273.15,
+    color="red",
+    linewidth=3,
+    marker="o",
+    markersize=3,
+    label="Hot water: left -> right"
+)
+
+line_profile_cold, = ax_profile.plot(
+    x,
+    T_cold_plot_C,
+    color="blue",
+    linewidth=3,
+    marker="o",
+    markersize=3,
+    drawstyle="steps-post",
+    label="Cold water / steam: right -> left"
+)
+
+line_profile_sat, = ax_profile.plot(
+    x,
+    T_sat_cold - 273.15,
+    color="black",
+    linestyle="--",
+    linewidth=1.5,
+    label="Cold-side saturation temperature"
+)
+
+subcooled_indices = np.where(phase_arr == "subcooled")[0]
+if subcooled_indices.size > 0:
+    ax_profile.axvspan(
+        x[subcooled_indices[0]],
+        x[subcooled_indices[-1]],
+        color="orange",
+        alpha=0.16
+    )
+
+if boiling_indices.size > 0:
+    ax_profile.axvspan(
+        x[boiling_indices[0]],
+        x[boiling_indices[-1]],
+        color="skyblue",
+        alpha=0.18
+    )
+
+if superheated_indices.size > 0:
+    ax_profile.axvspan(
+        x[superheated_indices[0]],
+        x[superheated_indices[-1]],
+        color="lightcoral",
+        alpha=0.12
+    )
+
+ax_profile.text(
+    x[0],
+    T_hot[0] - 273.15 + 5,
+    "Hot inlet",
+    color="red",
+    ha="left",
+    fontsize=12
+)
+
+ax_profile.text(
+    x[-1],
+    T_hot[-1] - 273.15 - 8,
+    "Hot outlet",
+    color="red",
+    ha="right",
+    fontsize=12
+)
+
+ax_profile.text(
+    x[-1],
+    T_cold[-1] - 273.15 - 12,
+    "Cold inlet",
+    color="blue",
+    ha="right",
+    fontsize=12
+)
+
+ax_profile.text(
+    x[0],
+    T_cold[0] - 273.15 + 6,
+    "Cold outlet",
+    color="blue",
+    ha="left",
+    fontsize=12
+)
+
+ax_profile.annotate(
+    "Hot flow",
+    xy=(0.25 * L, np.nanmean(T_hot - 273.15)),
+    xytext=(0.75 * L, np.nanmean(T_hot - 273.15)),
+    arrowprops=dict(arrowstyle="->", color="red", lw=2),
+    color="red",
+    fontsize=12
+)
+
+ax_profile.annotate(
+    "Cold flow",
+    xy=(0.75 * L, np.nanmin(T_cold_plot_C) - 8),
+    xytext=(0.25 * L, np.nanmin(T_cold_plot_C) - 8),
+    arrowprops=dict(arrowstyle="->", color="blue", lw=2),
+    color="blue",
+    fontsize=12
+)
+
+if FLIP_PLOT_LEFT_RIGHT:
+    ax_profile.invert_xaxis()
+
+ax_profile.set_xlabel(xlabel, fontsize=13)
+ax_profile.set_ylabel("Temperature [degC]", fontsize=13)
+ax_profile.set_title(
+    "Counter-flow Steam Generator Temperature Profile",
+    fontsize=18,
+    fontweight="bold"
+)
+ax_profile.grid(True, linestyle="--", alpha=0.5)
+ax_profile.legend(loc="upper left")
+fig_profile.tight_layout()
 
 
 # ============================================================
@@ -1475,7 +1974,223 @@ ax_pressure.set_title(
 
 ax_pressure.grid(True, linestyle="--", alpha=0.5)
 ax_pressure.legend(loc="best")
-plt.tight_layout()
+fig_temp.subplots_adjust(
+    left=0.06,
+    right=0.97,
+    top=0.90,
+    bottom=0.10,
+    wspace=0.28,
+    hspace=0.32
+)
+
+
+# ============================================================
+# Plot : wall temperature
+# ============================================================
+
+fig_wall, ax_wall = plt.subplots(figsize=(11, 6))
+
+line_wall_hot, = ax_wall.plot(
+    cell_x_hot_mid,
+    T_wall_hot_side_arr - 273.15,
+    color="red",
+    linewidth=2.5,
+    marker="o",
+    markersize=3,
+    label="Hot-water-side wall temperature"
+)
+
+line_wall_cold, = ax_wall.plot(
+    cell_x_cold_mid,
+    T_wall_cold_side_arr - 273.15,
+    color="blue",
+    linewidth=2.5,
+    marker="s",
+    markersize=3,
+    label="Cold-water-side wall temperature"
+)
+
+line_wall_mean, = ax_wall.plot(
+    cell_x_hot_mid,
+    T_wall_mean_arr - 273.15,
+    color="purple",
+    linewidth=2.0,
+    linestyle="--",
+    label="Wall centerline temperature"
+)
+
+if FLIP_PLOT_LEFT_RIGHT:
+    ax_wall.invert_xaxis()
+
+ax_wall.set_xlabel(xlabel, fontsize=12)
+ax_wall.set_ylabel("Wall temperature [degC]", fontsize=12)
+ax_wall.set_title(
+    "Wall Temperature Distribution",
+    fontsize=13,
+    fontweight="bold"
+)
+ax_wall.grid(True, linestyle="--", alpha=0.5)
+ax_wall.legend(loc="best")
+fig_wall.tight_layout()
+
+
+# ============================================================
+# Plot : all results on one page
+# ============================================================
+
+fig_all = plt.figure(figsize=(16, 10), constrained_layout=True)
+grid_all = fig_all.add_gridspec(
+    2,
+    2,
+    width_ratios=[1.0, 1.6],
+    height_ratios=[1.0, 1.0],
+    wspace=0.25,
+    hspace=0.32
+)
+
+ax_all_info = fig_all.add_subplot(grid_all[0, 0])
+ax_all_pressure = fig_all.add_subplot(grid_all[1, 0])
+ax_all_temp = fig_all.add_subplot(grid_all[0, 1])
+ax_all_wall = fig_all.add_subplot(grid_all[1, 1])
+
+ax_all_info.axis("off")
+ax_all_info.text(
+    0.02,
+    0.98,
+    condition_text,
+    va="top",
+    ha="left",
+    fontsize=10,
+    linespacing=1.25,
+    family="monospace"
+)
+ax_all_info.set_title(
+    "Case Summary",
+    fontsize=13,
+    fontweight="bold"
+)
+
+ax_all_temp.plot(
+    x,
+    T_hot - 273.15,
+    color="red",
+    linewidth=2.5,
+    marker="o",
+    markersize=2.5,
+    label="Hot water"
+)
+ax_all_temp.plot(
+    x,
+    T_cold_plot_C,
+    color="blue",
+    linewidth=2.5,
+    marker="o",
+    markersize=2.5,
+    drawstyle="steps-post",
+    label="Cold water / steam"
+)
+ax_all_temp.plot(
+    x,
+    T_sat_cold - 273.15,
+    color="black",
+    linestyle="--",
+    linewidth=1.4,
+    label="Cold-side Tsat"
+)
+if subcooled_indices.size > 0:
+    ax_all_temp.axvspan(
+        x[subcooled_indices[0]],
+        x[subcooled_indices[-1]],
+        color="orange",
+        alpha=0.12
+    )
+if boiling_indices.size > 0:
+    ax_all_temp.axvspan(
+        x[boiling_indices[0]],
+        x[boiling_indices[-1]],
+        color="skyblue",
+        alpha=0.16
+    )
+if superheated_indices.size > 0:
+    ax_all_temp.axvspan(
+        x[superheated_indices[0]],
+        x[superheated_indices[-1]],
+        color="lightcoral",
+        alpha=0.10
+    )
+if FLIP_PLOT_LEFT_RIGHT:
+    ax_all_temp.invert_xaxis()
+ax_all_temp.set_xlabel(xlabel)
+ax_all_temp.set_ylabel("Temperature [degC]")
+ax_all_temp.set_title("Temperature Profile", fontsize=13, fontweight="bold")
+ax_all_temp.grid(True, linestyle="--", alpha=0.45)
+ax_all_temp.legend(loc="best", fontsize=9)
+
+ax_all_pressure.plot(
+    x,
+    hot_cumulative_dP,
+    color="red",
+    linewidth=2.5,
+    marker="o",
+    markersize=2.5,
+    label="Hot side"
+)
+ax_all_pressure.plot(
+    x,
+    cold_cumulative_dP_from_inlet,
+    color="blue",
+    linewidth=2.5,
+    marker="s",
+    markersize=2.5,
+    label="Cold side"
+)
+if FLIP_PLOT_LEFT_RIGHT:
+    ax_all_pressure.invert_xaxis()
+ax_all_pressure.set_xlabel(xlabel)
+ax_all_pressure.set_ylabel("Cumulative pressure drop [kPa]")
+ax_all_pressure.set_title("Pressure Drop", fontsize=13, fontweight="bold")
+ax_all_pressure.grid(True, linestyle="--", alpha=0.45)
+ax_all_pressure.legend(loc="best", fontsize=9)
+
+ax_all_wall.plot(
+    cell_x_hot_mid,
+    T_wall_hot_side_arr - 273.15,
+    color="red",
+    linewidth=2.4,
+    marker="o",
+    markersize=2.5,
+    label="Hot-side wall"
+)
+ax_all_wall.plot(
+    cell_x_cold_mid,
+    T_wall_cold_side_arr - 273.15,
+    color="blue",
+    linewidth=2.4,
+    marker="s",
+    markersize=2.5,
+    label="Cold-side wall"
+)
+ax_all_wall.plot(
+    cell_x_hot_mid,
+    T_wall_mean_arr - 273.15,
+    color="purple",
+    linewidth=1.8,
+    linestyle="--",
+    label="Wall centerline"
+)
+if FLIP_PLOT_LEFT_RIGHT:
+    ax_all_wall.invert_xaxis()
+ax_all_wall.set_xlabel(xlabel)
+ax_all_wall.set_ylabel("Wall temperature [degC]")
+ax_all_wall.set_title("Wall Temperature", fontsize=13, fontweight="bold")
+ax_all_wall.grid(True, linestyle="--", alpha=0.45)
+ax_all_wall.legend(loc="best", fontsize=9)
+
+fig_all.suptitle(
+    "Counter-flow Steam Generator Results",
+    fontsize=18,
+    fontweight="bold"
+)
 
 fig_temp.suptitle(
     "Counter-flow Steam Generator Summary",
@@ -1483,38 +2198,41 @@ fig_temp.suptitle(
     fontweight="bold"
 )
 
-fig_temp.subplots_adjust(bottom=0.22)
+if enable_interactive_sliders:
+    fig_temp.subplots_adjust(bottom=0.22)
 
-ax_m_dot_slider = fig_temp.add_axes([0.27, 0.13, 0.58, 0.025])
-ax_temp_slider = fig_temp.add_axes([0.27, 0.09, 0.58, 0.025])
-ax_pressure_slider = fig_temp.add_axes([0.27, 0.05, 0.58, 0.025])
+    ax_m_dot_slider = fig_temp.add_axes([0.27, 0.13, 0.58, 0.025])
+    ax_temp_slider = fig_temp.add_axes([0.27, 0.09, 0.58, 0.025])
+    ax_pressure_slider = fig_temp.add_axes([0.27, 0.05, 0.58, 0.025])
 
-m_dot_slider = Slider(
-    ax=ax_m_dot_slider,
-    label="Cold m_dot [kg/s]",
-    valmin=0.02,
-    valmax=1.00,
-    valinit=m_dot_cold,
-    valstep=0.01
-)
+    m_dot_slider = Slider(
+        ax=ax_m_dot_slider,
+        label="Cold m_dot [kg/s]",
+        valmin=MIN_COLD_M_DOT,
+        valmax=1.00,
+        valinit=m_dot_cold,
+        valstep=0.01
+    )
 
-cold_temp_slider = Slider(
-    ax=ax_temp_slider,
-    label="Cold inlet T [degC]",
-    valmin=150.0,
-    valmax=320.0,
-    valinit=T_cold_in_C,
-    valstep=1.0
-)
+    cold_temp_slider = Slider(
+        ax=ax_temp_slider,
+        label="Cold inlet T [degC]",
+        valmin=150.0,
+        valmax=320.0,
+        valinit=T_cold_in_C,
+        valstep=1.0
+    )
 
-cold_pressure_slider = Slider(
-    ax=ax_pressure_slider,
-    label="Cold inlet P [MPa]",
-    valmin=3.0,
-    valmax=10.0,
-    valinit=P_cold_in / 1e6,
-    valstep=0.1
-)
+    cold_pressure_slider = Slider(
+        ax=ax_pressure_slider,
+        label="Cold inlet P [MPa]",
+        valmin=3.0,
+        valmax=10.0,
+        valinit=P_cold_in / 1e6,
+        valstep=0.1
+    )
+else:
+    fig_temp.subplots_adjust(bottom=0.08)
 
 
 def update_interactive_plot(_value):
@@ -1532,8 +2250,14 @@ def update_interactive_plot(_value):
     line_hot.set_ydata(result["T_hot_C"])
     line_cold.set_ydata(result["T_cold_plot_C"])
     line_sat.set_ydata(result["T_sat_cold_C"])
+    line_profile_hot.set_ydata(result["T_hot_C"])
+    line_profile_cold.set_ydata(result["T_cold_plot_C"])
+    line_profile_sat.set_ydata(result["T_sat_cold_C"])
     line_hot_pressure.set_ydata(result["hot_cumulative_dP"])
     line_cold_pressure.set_ydata(result["cold_cumulative_dP_from_inlet"])
+    line_wall_hot.set_ydata(result["T_wall_hot_side_C"])
+    line_wall_cold.set_ydata(result["T_wall_cold_side_C"])
+    line_wall_mean.set_ydata(result["T_wall_mean_C"])
     info_text.set_text(result["condition_text"])
 
     for patch in region_patches:
@@ -1568,20 +2292,64 @@ def update_interactive_plot(_value):
     ax_temp.autoscale_view(scalex=False, scaley=True)
     ax_pressure.relim()
     ax_pressure.autoscale_view(scalex=False, scaley=True)
+    ax_profile.relim()
+    ax_profile.autoscale_view(scalex=False, scaley=True)
+    ax_wall.relim()
+    ax_wall.autoscale_view(scalex=False, scaley=True)
     fig_temp.canvas.draw_idle()
+    fig_profile.canvas.draw_idle()
+    fig_wall.canvas.draw_idle()
 
 
-m_dot_slider.on_changed(update_interactive_plot)
-cold_temp_slider.on_changed(update_interactive_plot)
-cold_pressure_slider.on_changed(update_interactive_plot)
+if enable_interactive_sliders:
+    m_dot_slider.on_changed(update_interactive_plot)
+    cold_temp_slider.on_changed(update_interactive_plot)
+    cold_pressure_slider.on_changed(update_interactive_plot)
 
-fig_temp.savefig(
-    "steam_generator_summary.png",
+if save_fig_only and not save_individual_figures and not enable_interactive_sliders:
+    plt.close(fig_temp)
+    plt.close(fig_profile)
+    plt.close(fig_wall)
+    print(
+        "[Figure diagnostics] Closed individual figures before saving; "
+        "only the one-page summary remains open."
+    )
+
+print_figure_diagnostics("before saving figures")
+
+if save_individual_figures:
+    fig_temp.savefig(
+        "steam_generator_summary.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    fig_profile.savefig(
+        "steam_generator_temperature.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    fig_wall.savefig(
+        "steam_generator_wall_temperature.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+fig_all.savefig(
+    "steam_generator_all_results.png",
     dpi=300,
     bbox_inches="tight"
 )
 
-plt.show()
+print_figure_diagnostics("after saving figures")
+
+if save_fig_only:
+    plt.close("all")
+    print("[Figure diagnostics] save_fig_only=True, closed all figures.")
+else:
+    print_figure_diagnostics("before plt.show")
+    plt.show()
 
 
 # ============================================================
@@ -1621,6 +2389,11 @@ print(f"Cold outlet quality at x = 0 : {quality[0]:.3f}")
 print(f"Cold outlet phase : {phase[0]}")
 print(f"Cold outlet superheat : {max(T_cold[0] - T_sat_cold[0], 0.0):.2f} K")
 
+print("\n[Wall temperature]")
+print(f"Max hot-side wall temperature : {np.max(T_wall_hot_side_arr) - 273.15:.2f} degC")
+print(f"Max cold-side wall temperature : {np.max(T_wall_cold_side_arr) - 273.15:.2f} degC")
+print(f"Max mean wall temperature : {np.max(T_wall_mean_arr) - 273.15:.2f} degC")
+
 print("\n[Correlation used in cold side]")
 print(df_cell["cold_correlation"].value_counts())
 
@@ -1634,4 +2407,8 @@ if np.max(H_cold - H_g_cold) <= 0.0:
 print("==============================")
 print(f"Node CSV saved: {node_csv_path}")
 print(f"Cell CSV saved: {cell_csv_path}")
-print("Summary figure saved: steam_generator_summary.png")
+if save_individual_figures:
+    print("Summary figure saved: steam_generator_summary.png")
+    print("Temperature profile figure saved: steam_generator_temperature.png")
+    print("Wall temperature figure saved: steam_generator_wall_temperature.png")
+print("All results figure saved: steam_generator_all_results.png")
