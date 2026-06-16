@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
+from functools import lru_cache
 from CoolProp.CoolProp import PropsSI
 
 FLIP_PLOT_LEFT_RIGHT = False
@@ -60,13 +61,13 @@ def del_col_dryout_incipience_quality(
     P_critical = max(P_critical, 1.0e-12)
 
     Bo = q_flux / (G * h_fg)
-    reduced_pressure = np.clip(P / P_critical, 1.0e-12, 0.999999)
+    P_reduced = np.clip(P / P_critical, 1.0e-12, 0.999999)
 
     RLL = (
         0.437
         * (rho_g / rho_l)**0.073
         * (rho_l * sigma / G**2)**0.24
-        * (Dh / Bo)
+        * (Dh**0.721 / Bo)
     )**(1.0 / 0.96)
 
     x_di = (
@@ -74,10 +75,69 @@ def del_col_dryout_incipience_quality(
         * (4.0 * q_flux * RLL / (G * Dh * h_fg))**1.472
         * (G**2 * Dh / (rho_l * sigma))**0.3024
         * (Dh / 0.001)**0.1836
-        * (1.0 - reduced_pressure)**1.239
+        * (1.0 - P_reduced)**1.239
     )
 
     return x_di
+
+
+def del_col_dryout_terms(
+    q_flux,
+    G,
+    Dh,
+    h_fg,
+    rho_l,
+    rho_g,
+    sigma,
+    P,
+    P_critical
+):
+    """
+    Del Col et al. (2010) dryout incipience quality and local terms.
+    Units:
+    q_flux [W/m2], G [kg/m2-s], Dh [m], h_fg [J/kg],
+    rho_l/rho_g [kg/m3], sigma [N/m], pressures [Pa].
+    """
+
+    q_flux = max(q_flux, 1.0)
+    G = max(G, 1.0e-12)
+    Dh = max(Dh, 1.0e-12)
+    h_fg = max(h_fg, 1.0e-12)
+    rho_l = max(rho_l, 1.0e-12)
+    rho_g = max(rho_g, 1.0e-12)
+    sigma = max(sigma, 1.0e-12)
+    P_critical = max(P_critical, 1.0e-12)
+
+    Bo = q_flux / (G * h_fg)
+    P_reduced = np.clip(P / P_critical, 1.0e-12, 0.999999)
+
+    RLL = (
+        0.437
+        * (rho_g / rho_l)**0.073
+        * (rho_l * sigma / G**2)**0.24
+        * (Dh**0.721 / Bo)
+    )**(1.0 / 0.96)
+
+    x_di = (
+        0.4695
+        * (4.0 * q_flux * RLL / (G * Dh * h_fg))**1.472
+        * (G**2 * Dh / (rho_l * sigma))**0.3024
+        * (Dh / 0.001)**0.1836
+        * (1.0 - P_reduced)**1.239
+    )
+
+    return {
+        "x_di": x_di,
+        "Bo": Bo,
+        "RLL": RLL,
+        "P_reduced": P_reduced,
+        "rho_l": rho_l,
+        "rho_g": rho_g,
+        "sigma": sigma,
+        "G": G,
+        "h_fg": h_fg,
+        "q_flux": q_flux,
+    }
 
 
 def dougall_rohsenow_post_chf_correlation(
@@ -122,6 +182,55 @@ def bergles_rohsenow_onb_deltaT(q_flux, P_cold):
     deltaT_onb = 0.556 * (q_flux / (1082.0 * P_bar**1.156))**n
 
     return deltaT_onb
+
+
+def subcooled_boiling_heat_transfer_coefficient(
+    q_flux,
+    G,
+    D,
+    h_fg,
+    cp_l,
+    k_l,
+    mu_l_bulk,
+    mu_l_wall,
+    Re_l,
+    Pr_l,
+    T_sat,
+    T_bulk
+):
+    """
+    Subcooled boiling heat transfer coefficient [W/m2-K].
+
+    h_tp = psi * h_sp_l
+    psi = 267 * Bo**0.86 * Ja_star**(-0.6) * Pr_l**0.23
+    """
+
+    q_flux = max(q_flux, 1.0)
+    G = max(G, 1.0e-12)
+    D = max(D, 1.0e-12)
+    h_fg = max(h_fg, 1.0e-12)
+    cp_l = max(cp_l, 1.0e-12)
+    k_l = max(k_l, 1.0e-12)
+    mu_l_bulk = max(mu_l_bulk, 1.0e-12)
+    mu_l_wall = max(mu_l_wall, 1.0e-12)
+    Re_l = max(Re_l, 1.0)
+    Pr_l = max(Pr_l, 1.0e-12)
+
+    deltaT_sub_in = max(T_sat - T_bulk, 1.0e-6)
+    Ja_star = cp_l * deltaT_sub_in / h_fg
+    Bo = q_flux / (G * h_fg)
+
+    h_sp_l = (
+        0.023
+        * Re_l**0.8
+        * Pr_l**0.4
+        * (mu_l_bulk / mu_l_wall)**0.262
+        * k_l
+        / D
+    )
+    psi = 267.0 * Bo**0.86 * Ja_star**(-0.6) * Pr_l**0.23
+
+    return psi * h_sp_l
 
 
 # ============================================================
@@ -207,6 +316,44 @@ def separated_flow_pressure_drop(
 # ============================================================
 # Cold-side state
 # ============================================================
+
+@lru_cache(maxsize=4096)
+def _get_cold_saturation_properties_cached(P_cold_rounded, fluid_cold):
+    P_cold = float(P_cold_rounded)
+    T_sat = PropsSI("T", "P", P_cold, "Q", 0, fluid_cold)
+    H_f = PropsSI("H", "P", P_cold, "Q", 0, fluid_cold)
+    H_g = PropsSI("H", "P", P_cold, "Q", 1, fluid_cold)
+    H_fg = H_g - H_f
+
+    rho_l = PropsSI("D", "P", P_cold, "Q", 0, fluid_cold)
+    rho_g = PropsSI("D", "P", P_cold, "Q", 1, fluid_cold)
+    mu_l = PropsSI("V", "P", P_cold, "Q", 0, fluid_cold)
+    mu_g = PropsSI("V", "P", P_cold, "Q", 1, fluid_cold)
+    k_g = PropsSI("L", "P", P_cold, "Q", 1, fluid_cold)
+    cp_g = PropsSI("C", "P", P_cold, "Q", 1, fluid_cold)
+    Pr_g = cp_g * mu_g / k_g
+    sigma = PropsSI("I", "P", P_cold, "Q", 0, fluid_cold)
+
+    return {
+        "T_sat": T_sat,
+        "H_f": H_f,
+        "H_g": H_g,
+        "H_fg": H_fg,
+        "rho_l": rho_l,
+        "rho_g": rho_g,
+        "mu_l": mu_l,
+        "mu_g": mu_g,
+        "k_g": k_g,
+        "cp_g": cp_g,
+        "Pr_g": Pr_g,
+        "sigma": sigma,
+    }
+
+
+def get_cold_saturation_properties(P_cold, fluid_cold):
+    P_cold_rounded = round(float(P_cold) / 1000.0) * 1000.0
+    return _get_cold_saturation_properties_cached(P_cold_rounded, fluid_cold)
+
 
 def get_cold_state(Hc, P_cold, fluid_cold, H_f, H_g, H_fg, T_sat):
 
@@ -407,8 +554,8 @@ def save_csv_with_fallback(df, filename):
 # Geometry and input conditions
 # ============================================================
 
-L = 85.55
-N = 50
+L = 51.852
+N = 100
 dx = L / N
 
 D_inner = 0.012
@@ -464,13 +611,24 @@ phase = [""] * (N + 1)
 
 h_hot_arr = np.zeros(N)
 h_cold_arr = np.zeros(N)
+h_single_phase_arr = np.zeros(N)
+h_subcooled_arr = np.full(N, np.nan)
 U_arr = np.zeros(N)
 q_arr = np.zeros(N)
 q_flux_arr = np.zeros(N)
 T_hot_cell = np.zeros(N)
 T_cold_cell = np.zeros(N)
 quality_cell = np.zeros(N)
+x_di_raw_cell = np.full(N, np.nan)
 x_di_cell = np.full(N, np.nan)
+Bo_cell = np.full(N, np.nan)
+RLL_cell = np.full(N, np.nan)
+P_reduced_cell = np.full(N, np.nan)
+rho_l_cell = np.full(N, np.nan)
+rho_g_cell = np.full(N, np.nan)
+sigma_cell = np.full(N, np.nan)
+G_cold_cell = np.full(N, np.nan)
+h_fg_cell = np.full(N, np.nan)
 CHF_region = ["pre_CHF"] * N
 T_wall_hot_cell = np.zeros(N)
 T_wall_cold_cell = np.zeros(N)
@@ -527,7 +685,7 @@ H_cold_in = PropsSI("H", "P", P_cold, "T", T_cold_in, fluid_cold)
 # Counter-current marching calculation
 # ============================================================
 
-def run_counter_current_march(H_hot_out_guess):
+def run_counter_current_march(H_hot_out_guess, P_hot_out_guess):
     """
     March from x = 0 to x = L in physical coordinates.
 
@@ -540,18 +698,33 @@ def run_counter_current_march(H_hot_out_guess):
     H_hot_local = np.zeros(N + 1)
     T_cold_local = np.zeros(N + 1)
     H_cold_local = np.zeros(N + 1)
+    P_hot_local = np.zeros(N + 1)
+    P_cold_local = np.zeros(N + 1)
     quality_local = np.zeros(N + 1)
     phase_local = [""] * (N + 1)
 
     h_hot_local_arr = np.zeros(N)
     h_cold_local_arr = np.zeros(N)
+    h_single_phase_local_arr = np.zeros(N)
+    h_subcooled_local_arr = np.full(N, np.nan)
     U_local_arr = np.zeros(N)
     q_local_arr = np.zeros(N)
     q_flux_local_arr = np.zeros(N)
+    P_hot_local_cell = np.zeros(N)
+    P_cold_local_cell = np.zeros(N)
     T_hot_local_cell = np.zeros(N)
     T_cold_local_cell = np.zeros(N)
     quality_local_cell = np.zeros(N)
+    x_di_raw_local_cell = np.full(N, np.nan)
     x_di_local_cell = np.full(N, np.nan)
+    Bo_local_cell = np.full(N, np.nan)
+    RLL_local_cell = np.full(N, np.nan)
+    P_reduced_local_cell = np.full(N, np.nan)
+    rho_l_local_cell = np.full(N, np.nan)
+    rho_g_local_cell = np.full(N, np.nan)
+    sigma_local_cell = np.full(N, np.nan)
+    G_cold_local_cell = np.full(N, np.nan)
+    h_fg_local_cell = np.full(N, np.nan)
     CHF_region_local = ["pre_CHF"] * N
     T_wall_hot_local_cell = np.zeros(N)
     T_wall_cold_local_cell = np.zeros(N)
@@ -572,20 +745,36 @@ def run_counter_current_march(H_hot_out_guess):
     x_onb_local = None
     x_chf_local = None
     x_superheated_local = None
-    onb_started_local = False
     chf_started_local = False
 
     H_hot_local[0] = H_hot_out_guess
     H_cold_local[0] = H_cold_in
+    P_hot_local[0] = P_hot_out_guess
+    P_cold_local[0] = P_cold_in
 
     for i in range(N):
 
-        T_hot_local[i] = PropsSI("T", "P", P_hot, "H", H_hot_local[i], fluid_hot)
+        P_hot_i = P_hot_local[i]
+        P_cold_i = P_cold_local[i]
+        sat_i = get_cold_saturation_properties(P_cold_i, fluid_cold)
+        T_sat_i = sat_i["T_sat"]
+        H_f_i = sat_i["H_f"]
+        H_g_i = sat_i["H_g"]
+        H_fg_i = sat_i["H_fg"]
+        rho_l_sat_i = sat_i["rho_l"]
+        rho_g_sat_i = sat_i["rho_g"]
+        mu_l_sat_i = sat_i["mu_l"]
+        mu_g_sat_i = sat_i["mu_g"]
+        k_g_sat_i = sat_i["k_g"]
+        Pr_g_sat_i = sat_i["Pr_g"]
+        sigma_sat_i = sat_i["sigma"]
 
-        rho_h = PropsSI("D", "P", P_hot, "H", H_hot_local[i], fluid_hot)
-        mu_h = PropsSI("V", "P", P_hot, "H", H_hot_local[i], fluid_hot)
-        k_h = PropsSI("L", "P", P_hot, "H", H_hot_local[i], fluid_hot)
-        cp_h = PropsSI("C", "P", P_hot, "H", H_hot_local[i], fluid_hot)
+        T_hot_local[i] = PropsSI("T", "P", P_hot_i, "H", H_hot_local[i], fluid_hot)
+
+        rho_h = PropsSI("D", "P", P_hot_i, "H", H_hot_local[i], fluid_hot)
+        mu_h = PropsSI("V", "P", P_hot_i, "H", H_hot_local[i], fluid_hot)
+        k_h = PropsSI("L", "P", P_hot_i, "H", H_hot_local[i], fluid_hot)
+        cp_h = PropsSI("C", "P", P_hot_i, "H", H_hot_local[i], fluid_hot)
 
         V_h = m_dot_hot / (rho_h * A_hot)
         Re_h = rho_h * V_h * D_inner / mu_h
@@ -616,23 +805,33 @@ def run_counter_current_march(H_hot_out_guess):
             cp_c
         ) = get_cold_state(
             H_cold_local[i],
-            P_cold,
+            P_cold_i,
             fluid_cold,
-            H_f,
-            H_g,
-            H_fg,
-            T_sat
+            H_f_i,
+            H_g_i,
+            H_fg_i,
+            T_sat_i
         )
 
         V_c = m_dot_cold / (rho_c * A_cold)
         Re_c = rho_c * V_c * D_inner / mu_c
         Pr_c = cp_c * mu_c / k_c
+        h_single_phase = dittus_boelter(
+            Re=Re_c,
+            Pr=Pr_c,
+            k=k_c,
+            Dh=D_inner,
+            heating=True
+        )
+        h_subcooled = np.nan
         T_cold_effective = get_cold_effective_temperature(
             phase_local[i],
             T_cold_local[i],
-            T_sat
+            T_sat_i
         )
         x_di_detection = np.nan
+        x_di_raw_detection = np.nan
+        del_col_terms_detection = None
 
         q_flux_guess = 50000.0
 
@@ -644,7 +843,7 @@ def run_counter_current_march(H_hot_out_guess):
             D_inner=D_inner,
             q_flux=q_flux_guess,
             G_cold=G_cold,
-            H_fg=H_fg,
+            H_fg=H_fg_i,
             quality_local=quality_local[i]
         )
 
@@ -674,7 +873,7 @@ def run_counter_current_march(H_hot_out_guess):
                     D_inner=D_inner,
                     q_flux=q_flux_local,
                     G_cold=G_cold,
-                    H_fg=H_fg,
+                    H_fg=H_fg_i,
                     quality_local=quality_local[i]
                 )
 
@@ -689,17 +888,19 @@ def run_counter_current_march(H_hot_out_guess):
 
             if phase_local[i] == "boiling":
 
-                x_di_detection = del_col_dryout_incipience_quality(
+                del_col_terms_detection = del_col_dryout_terms(
                     q_flux=q_flux_local,
                     G=G_cold,
                     Dh=D_inner,
-                    h_fg=H_fg,
-                    rho_l=rho_l_sat,
-                    rho_g=rho_g_sat,
-                    sigma=sigma_sat,
-                    P=P_cold,
+                    h_fg=H_fg_i,
+                    rho_l=rho_l_sat_i,
+                    rho_g=rho_g_sat_i,
+                    sigma=sigma_sat_i,
+                    P=P_cold_i,
                     P_critical=P_critical_cold
                 )
+                x_di_detection = del_col_terms_detection["x_di"]
+                x_di_raw_detection = x_di_detection
 
                 is_post_chf = chf_started_local or quality_local[i] >= x_di_detection
 
@@ -707,11 +908,11 @@ def run_counter_current_march(H_hot_out_guess):
                     h_cold = dougall_rohsenow_post_chf_correlation(
                         G=G_cold,
                         Dh=D_inner,
-                        mu_g=mu_g_sat,
-                        rho_g=rho_g_sat,
-                        rho_l=rho_l_sat,
-                        Pr_g=Pr_g_sat,
-                        k_g=k_g_sat,
+                        mu_g=mu_g_sat_i,
+                        rho_g=rho_g_sat_i,
+                        rho_l=rho_l_sat_i,
+                        Pr_g=Pr_g_sat_i,
+                        k_g=k_g_sat_i,
                         quality=quality_local[i]
                     )
                     corr_name = "Dougall-Rohsenow post-CHF"
@@ -733,24 +934,28 @@ def run_counter_current_march(H_hot_out_guess):
             h_cold=h_cold,
             wall_resistance_area=t_wall / k_wall
         )
-        DeltaT_actual = T_wall_cold_local - T_sat
-        DeltaT_ONB = bergles_rohsenow_onb_deltaT(q_flux_local, P_cold)
+        DeltaT_actual = T_wall_cold_local - T_sat_i
+        DeltaT_ONB = bergles_rohsenow_onb_deltaT(q_flux_local, P_cold_i)
         x_di_local = x_di_detection
+        x_di_raw_local = x_di_raw_detection
+        del_col_terms_local = del_col_terms_detection
         chf_region_name = "post_CHF" if chf_started_local else "pre_CHF"
 
         if phase_local[i] == "boiling":
             if np.isnan(x_di_local):
-                x_di_local = del_col_dryout_incipience_quality(
+                del_col_terms_local = del_col_dryout_terms(
                     q_flux=q_flux_local,
                     G=G_cold,
                     Dh=D_inner,
-                    h_fg=H_fg,
-                    rho_l=rho_l_sat,
-                    rho_g=rho_g_sat,
-                    sigma=sigma_sat,
-                    P=P_cold,
+                    h_fg=H_fg_i,
+                    rho_l=rho_l_sat_i,
+                    rho_g=rho_g_sat_i,
+                    sigma=sigma_sat_i,
+                    P=P_cold_i,
                     P_critical=P_critical_cold
                 )
+                x_di_local = del_col_terms_local["x_di"]
+                x_di_raw_local = x_di_local
 
             if chf_started_local or quality_local[i] >= x_di_local:
                 chf_region_name = "post_CHF"
@@ -761,46 +966,68 @@ def run_counter_current_march(H_hot_out_guess):
                 chf_region_name = "pre_CHF"
 
         if phase_local[i] == "subcooled":
-            if (not onb_started_local) and DeltaT_actual >= DeltaT_ONB:
-                onb_started_local = True
+            is_onb = (
+                T_cold_local[i] < T_sat_i
+                and DeltaT_actual >= DeltaT_ONB
+            )
+
+            if x_onb_local is None and is_onb:
                 x_onb_local = x[i]
 
-            if onb_started_local:
-                h_cold, corr_name = get_cold_heat_transfer_coefficient(
-                    phase="subcooled_boiling",
-                    Re_c=Re_c,
-                    Pr_c=Pr_c,
-                    k_c=k_c,
-                    D_inner=D_inner,
-                    q_flux=q_flux_local,
-                    G_cold=G_cold,
-                    H_fg=H_fg,
-                    quality_local=0.0
-                )
+            if is_onb:
+                for _ in range(3):
+                    if T_wall_cold_local >= T_sat_i - 0.1:
+                        mu_l_wall = mu_l_sat_i
+                    else:
+                        mu_l_wall = PropsSI(
+                            "V",
+                            "P",
+                            P_cold_i,
+                            "T",
+                            T_wall_cold_local,
+                            fluid_cold
+                        )
+                    h_subcooled = subcooled_boiling_heat_transfer_coefficient(
+                        q_flux=q_flux_local,
+                        G=G_cold,
+                        D=D_inner,
+                        h_fg=H_fg_i,
+                        cp_l=cp_c,
+                        k_l=k_c,
+                        mu_l_bulk=mu_c,
+                        mu_l_wall=mu_l_wall,
+                        Re_l=Re_c,
+                        Pr_l=Pr_c,
+                        T_sat=T_sat_i,
+                        T_bulk=T_cold_local[i]
+                    )
+                    h_cold = h_subcooled
+                    corr_name = "Subcooled boiling h_tp = psi*h_sp_l"
 
-                U = 1.0 / (
-                    1.0 / h_hot
-                    + t_wall / k_wall
-                    + 1.0 / h_cold
-                )
+                    U = 1.0 / (
+                        1.0 / h_hot
+                        + t_wall / k_wall
+                        + 1.0 / h_cold
+                    )
 
-                if dT <= 0.0:
-                    q = 0.0
-                    q_flux_local = 0.0
-                else:
-                    q = U * P_heat * dx * dT
-                    q_flux_local = max(q / (P_heat * dx), 0.0)
+                    if dT <= 0.0:
+                        q = 0.0
+                        q_flux_local = 0.0
+                    else:
+                        q = U * P_heat * dx * dT
+                        q_flux_local = max(q / (P_heat * dx), 0.0)
 
-                T_wall_hot_local, T_wall_cold_local = calc_wall_temperatures(
-                    T_hot_bulk=T_hot_local[i],
-                    T_cold_effective=T_cold_effective,
-                    q_flux=q_flux_local,
-                    h_hot=h_hot,
-                    h_cold=h_cold,
-                    wall_resistance_area=t_wall / k_wall
-                )
-                DeltaT_actual = T_wall_cold_local - T_sat
-                DeltaT_ONB = bergles_rohsenow_onb_deltaT(q_flux_local, P_cold)
+                    T_wall_hot_local, T_wall_cold_local = calc_wall_temperatures(
+                        T_hot_bulk=T_hot_local[i],
+                        T_cold_effective=T_cold_effective,
+                        q_flux=q_flux_local,
+                        h_hot=h_hot,
+                        h_cold=h_cold,
+                        wall_resistance_area=t_wall / k_wall
+                    )
+
+                DeltaT_actual = T_wall_cold_local - T_sat_i
+                DeltaT_ONB = bergles_rohsenow_onb_deltaT(q_flux_local, P_cold_i)
                 region_name = "Subcooled Boiling"
             else:
                 region_name = "Single Phase Liquid"
@@ -822,10 +1049,10 @@ def run_counter_current_march(H_hot_out_guess):
                 quality=quality_local[i],
                 G=G_cold,
                 Dh=D_inner,
-                rho_l=rho_l_sat,
-                rho_g=rho_g_sat,
-                mu_l=mu_l_sat,
-                mu_g=mu_g_sat,
+                rho_l=rho_l_sat_i,
+                rho_g=rho_g_sat_i,
+                mu_l=mu_l_sat_i,
+                mu_g=mu_g_sat_i,
                 model=pressure_drop_model,
                 channel_shape=channel_shape
             )
@@ -855,18 +1082,32 @@ def run_counter_current_march(H_hot_out_guess):
 
         h_hot_local_arr[i] = h_hot
         h_cold_local_arr[i] = h_cold
+        h_single_phase_local_arr[i] = h_single_phase
+        h_subcooled_local_arr[i] = h_subcooled
         U_local_arr[i] = U
         q_local_arr[i] = q
         q_flux_local_arr[i] = q_flux_local
+        P_hot_local_cell[i] = P_hot_i
+        P_cold_local_cell[i] = P_cold_i
         T_hot_local_cell[i] = T_hot_local[i]
         T_cold_local_cell[i] = T_cold_local[i]
         quality_local_cell[i] = quality_local[i]
+        x_di_raw_local_cell[i] = x_di_raw_local
         x_di_local_cell[i] = x_di_local
+        if del_col_terms_local is not None:
+            Bo_local_cell[i] = del_col_terms_local["Bo"]
+            RLL_local_cell[i] = del_col_terms_local["RLL"]
+            P_reduced_local_cell[i] = del_col_terms_local["P_reduced"]
+            rho_l_local_cell[i] = del_col_terms_local["rho_l"]
+            rho_g_local_cell[i] = del_col_terms_local["rho_g"]
+            sigma_local_cell[i] = del_col_terms_local["sigma"]
+            G_cold_local_cell[i] = del_col_terms_local["G"]
+            h_fg_local_cell[i] = del_col_terms_local["h_fg"]
         CHF_region_local[i] = chf_region_name
         T_wall_hot_local_cell[i] = T_wall_hot_local
         T_wall_cold_local_cell[i] = T_wall_cold_local
         R_wall_local_cell[i] = np.log(D_outer / D_inner) / (2.0 * np.pi * k_wall * dx)
-        T_sat_local_cell[i] = T_sat
+        T_sat_local_cell[i] = T_sat_i
         DeltaT_actual_local_cell[i] = DeltaT_actual
         DeltaT_ONB_local_cell[i] = DeltaT_ONB
         cold_region_local[i] = region_name
@@ -883,9 +1124,12 @@ def run_counter_current_march(H_hot_out_guess):
         # Moving from x = 0 to x = L is opposite to the hot-flow direction.
         H_hot_local[i + 1] = H_hot_local[i] + q / m_dot_hot
         H_cold_local[i + 1] = H_cold_local[i] + q / m_dot_cold
+        P_hot_local[i + 1] = P_hot_local[i] + dP_hot_local_cell[i]
+        P_cold_local[i + 1] = max(P_cold_local[i] - dP_cold_local_cell[i], 1.0e5)
 
     for i in range(N + 1):
-        T_hot_local[i] = PropsSI("T", "P", P_hot, "H", H_hot_local[i], fluid_hot)
+        sat_i = get_cold_saturation_properties(P_cold_local[i], fluid_cold)
+        T_hot_local[i] = PropsSI("T", "P", P_hot_local[i], "H", H_hot_local[i], fluid_hot)
         (
             T_cold_local[i],
             quality_local[i],
@@ -896,12 +1140,12 @@ def run_counter_current_march(H_hot_out_guess):
             cp_c
         ) = get_cold_state(
             H_cold_local[i],
-            P_cold,
+            P_cold_local[i],
             fluid_cold,
-            H_f,
-            H_g,
-            H_fg,
-            T_sat
+            sat_i["H_f"],
+            sat_i["H_g"],
+            sat_i["H_fg"],
+            sat_i["T_sat"]
         )
 
     if x_superheated_local is None:
@@ -914,17 +1158,32 @@ def run_counter_current_march(H_hot_out_guess):
         "H_hot": H_hot_local,
         "T_cold": T_cold_local,
         "H_cold": H_cold_local,
+        "P_hot": P_hot_local,
+        "P_cold": P_cold_local,
         "quality": quality_local,
         "phase": phase_local,
         "h_hot_arr": h_hot_local_arr,
         "h_cold_arr": h_cold_local_arr,
+        "h_single_phase_arr": h_single_phase_local_arr,
+        "h_subcooled_arr": h_subcooled_local_arr,
         "U_arr": U_local_arr,
         "q_arr": q_local_arr,
         "q_flux_arr": q_flux_local_arr,
+        "P_hot_cell": P_hot_local_cell,
+        "P_cold_cell": P_cold_local_cell,
         "T_hot_cell": T_hot_local_cell,
         "T_cold_cell": T_cold_local_cell,
         "quality_cell": quality_local_cell,
+        "x_di_raw_cell": x_di_raw_local_cell,
         "x_di_cell": x_di_local_cell,
+        "Bo_cell": Bo_local_cell,
+        "RLL_cell": RLL_local_cell,
+        "P_reduced_cell": P_reduced_local_cell,
+        "rho_l_cell": rho_l_local_cell,
+        "rho_g_cell": rho_g_local_cell,
+        "sigma_cell": sigma_local_cell,
+        "G_cold_cell": G_cold_local_cell,
+        "h_fg_cell": h_fg_local_cell,
         "CHF_region": CHF_region_local,
         "T_wall_hot_cell": T_wall_hot_local_cell,
         "T_wall_cold_cell": T_wall_cold_local_cell,
@@ -947,14 +1206,14 @@ def run_counter_current_march(H_hot_out_guess):
     }
 
 
-def solve_hot_outlet_enthalpy():
+def solve_hot_outlet_enthalpy(P_hot_out_guess):
     T_low = max(PropsSI("Tmin", fluid_hot) + 1.0, T_cold_in)
     T_high = T_hot_in
-    H_low = PropsSI("H", "P", P_hot, "T", T_low, fluid_hot)
+    H_low = PropsSI("H", "P", P_hot_out_guess, "T", T_low, fluid_hot)
     H_high = H_hot_in
 
     def residual(H_guess):
-        return run_counter_current_march(H_guess)["H_hot"][-1] - H_hot_in
+        return run_counter_current_march(H_guess, P_hot_out_guess)["H_hot"][-1] - H_hot_in
 
     r_low = residual(H_low)
     r_high = residual(H_high)
@@ -963,11 +1222,11 @@ def solve_hot_outlet_enthalpy():
         print("Warning: could not bracket hot outlet enthalpy for counter-current solve")
         return H_low if abs(r_low) < abs(r_high) else H_high
 
-    for _ in range(24):
+    for _ in range(10):
         H_mid = 0.5 * (H_low + H_high)
         r_mid = residual(H_mid)
 
-        if abs(r_mid) < 1.0:
+        if abs(r_mid) < 50.0:
             return H_mid
 
         if r_low * r_mid <= 0.0:
@@ -980,24 +1239,58 @@ def solve_hot_outlet_enthalpy():
     return 0.5 * (H_low + H_high)
 
 
-H_hot_out = solve_hot_outlet_enthalpy()
-solution = run_counter_current_march(H_hot_out)
+def solve_hot_outlet_conditions():
+    P_hot_out_guess = P_hot_in
+    H_hot_out_guess = H_hot_in
+
+    for _ in range(3):
+        H_hot_out_guess = solve_hot_outlet_enthalpy(P_hot_out_guess)
+        trial = run_counter_current_march(H_hot_out_guess, P_hot_out_guess)
+        pressure_residual = trial["P_hot"][-1] - P_hot_in
+
+        if abs(pressure_residual) < 100.0:
+            return H_hot_out_guess, P_hot_out_guess, trial
+
+        P_hot_out_guess = max(P_hot_out_guess - pressure_residual, 1.0e5)
+
+    return H_hot_out_guess, P_hot_out_guess, run_counter_current_march(
+        H_hot_out_guess,
+        P_hot_out_guess
+    )
+
+
+H_hot_out, P_hot_out, solution = solve_hot_outlet_conditions()
 
 T_hot = solution["T_hot"]
 H_hot = solution["H_hot"]
 T_cold = solution["T_cold"]
 H_cold = solution["H_cold"]
+P_hot_node = solution["P_hot"]
+P_cold_node = solution["P_cold"]
 quality = solution["quality"]
 phase = solution["phase"]
 h_hot_arr = solution["h_hot_arr"]
 h_cold_arr = solution["h_cold_arr"]
+h_single_phase_arr = solution["h_single_phase_arr"]
+h_subcooled_arr = solution["h_subcooled_arr"]
 U_arr = solution["U_arr"]
 q_arr = solution["q_arr"]
 q_flux_arr = solution["q_flux_arr"]
+P_hot_cell = solution["P_hot_cell"]
+P_cold_cell = solution["P_cold_cell"]
 T_hot_cell = solution["T_hot_cell"]
 T_cold_cell = solution["T_cold_cell"]
 quality_cell = solution["quality_cell"]
+x_di_raw_cell = solution["x_di_raw_cell"]
 x_di_cell = solution["x_di_cell"]
+Bo_cell = solution["Bo_cell"]
+RLL_cell = solution["RLL_cell"]
+P_reduced_cell = solution["P_reduced_cell"]
+rho_l_cell = solution["rho_l_cell"]
+rho_g_cell = solution["rho_g_cell"]
+sigma_cell = solution["sigma_cell"]
+G_cold_cell = solution["G_cold_cell"]
+h_fg_cell = solution["h_fg_cell"]
 CHF_region = solution["CHF_region"]
 T_wall_hot_cell = solution["T_wall_hot_cell"]
 T_wall_cold_cell = solution["T_wall_cold_cell"]
@@ -1025,7 +1318,8 @@ x_superheated = solution["x_superheated"]
 
 for i in range(N + 1):
 
-    T_hot[i] = PropsSI("T", "P", P_hot, "H", H_hot[i], fluid_hot)
+    sat_i = get_cold_saturation_properties(P_cold_node[i], fluid_cold)
+    T_hot[i] = PropsSI("T", "P", P_hot_node[i], "H", H_hot[i], fluid_hot)
 
     (
         T_cold[i],
@@ -1037,12 +1331,12 @@ for i in range(N + 1):
         cp_c
     ) = get_cold_state(
         H_cold[i],
-        P_cold,
+        P_cold_node[i],
         fluid_cold,
-        H_f,
-        H_g,
-        H_fg,
-        T_sat
+        sat_i["H_f"],
+        sat_i["H_g"],
+        sat_i["H_fg"],
+        sat_i["T_sat"]
     )
 
 if x_superheated is None:
@@ -1054,6 +1348,38 @@ T_hot_local = cell_values_to_node_values(T_hot_cell)
 T_cold_local = cell_values_to_node_values(T_cold_cell)
 T_wall_hot = cell_values_to_node_values(T_wall_hot_cell)
 T_wall_cold = cell_values_to_node_values(T_wall_cold_cell)
+T_sat_node = np.array([
+    get_cold_saturation_properties(P_cold_node[i], fluid_cold)["T_sat"]
+    for i in range(N + 1)
+])
+DeltaT_actual_node = T_wall_cold - T_sat_node
+DeltaT_ONB_node = cell_values_to_node_values(DeltaT_ONB_cell)
+ONB_margin_cell = DeltaT_actual_cell - DeltaT_ONB_cell
+ONB_margin_node = DeltaT_actual_node - DeltaT_ONB_node
+q_flux_node = cell_values_to_node_values(q_flux_arr)
+h_cold_node = cell_values_to_node_values(h_cold_arr)
+h_single_phase_node = cell_values_to_node_values(h_single_phase_arr)
+h_subcooled_node = cell_values_to_node_values(h_subcooled_arr)
+cold_region_node = [""] * (N + 1)
+for i in range(N + 1):
+    if i == 0:
+        cold_region_node[i] = cold_region[0]
+    elif i == N:
+        cold_region_node[i] = cold_region[-1]
+    else:
+        cold_region_node[i] = cold_region[i - 1]
+
+subcooled_onb_mask = T_cold_cell < T_sat_cell
+if np.any(subcooled_onb_mask):
+    onb_debug_indices = np.where(subcooled_onb_mask)[0]
+    best_onb_idx = onb_debug_indices[np.argmax(ONB_margin_cell[onb_debug_indices])]
+else:
+    best_onb_idx = int(np.argmax(ONB_margin_cell))
+
+max_deltaT_actual = float(np.max(DeltaT_actual_cell))
+min_deltaT_ONB = float(np.min(DeltaT_ONB_cell))
+max_ONB_margin = float(ONB_margin_cell[best_onb_idx])
+x_max_ONB_margin = float(0.5 * (x[best_onb_idx] + x[best_onb_idx + 1]))
 
 if np.any(T_wall_cold > T_wall_hot):
     print("Warning: cold-side wall temperature exceeds hot-side wall temperature")
@@ -1103,11 +1429,24 @@ dP_cold_cumulative_cell[:] = dP_cold_cumulative[:-1]
 
 df_node = pd.DataFrame({
     "x_m": x,
+    "P_hot": P_hot_node,
+    "P_cold": P_cold_node,
     "T_hot_C": T_hot - 273.15,
+    "T_cold": T_cold,
     "T_cold_C": T_cold - 273.15,
     "T_wall_hot_C": T_wall_hot - 273.15,
+    "T_wall_cold": T_wall_cold,
     "T_wall_cold_C": T_wall_cold - 273.15,
-    "T_sat_cold_C": np.full(N + 1, T_sat - 273.15),
+    "T_sat": T_sat_node,
+    "T_sat_cold_C": T_sat_node - 273.15,
+    "DeltaT_actual": DeltaT_actual_node,
+    "DeltaT_ONB": DeltaT_ONB_node,
+    "ONB_margin": ONB_margin_node,
+    "q_flux": q_flux_node,
+    "h_single_phase": h_single_phase_node,
+    "h_subcooled": h_subcooled_node,
+    "h_cold": h_cold_node,
+    "cold_region": cold_region_node,
     "cold_quality": quality,
     "cold_phase": phase,
     "cold_cumulative_dP_Pa": dP_cold_cumulative,
@@ -1125,13 +1464,26 @@ df_cell = pd.DataFrame({
     "T_wall_cold": T_wall_cold_cell,
     "DeltaT_actual": DeltaT_actual_cell,
     "DeltaT_ONB": DeltaT_ONB_cell,
+    "ONB_margin": ONB_margin_cell,
     "quality": quality_cell,
+    "Bo": Bo_cell,
+    "RLL": RLL_cell,
+    "P_reduced": P_reduced_cell,
+    "rho_l": rho_l_cell,
+    "rho_g": rho_g_cell,
+    "sigma": sigma_cell,
+    "G": G_cold_cell,
+    "h_fg": h_fg_cell,
+    "q_flux": q_flux_arr,
+    "x_di_raw": x_di_raw_cell,
     "x_di": x_di_cell,
     "cold_region": cold_region,
+    "h_single_phase": h_single_phase_arr,
+    "h_subcooled": h_subcooled_arr,
     "h_hot": h_hot_arr,
     "h_cold": h_cold_arr,
-    "P_hot": np.full(N, P_hot),
-    "P_cold": np.full(N, P_cold),
+    "P_hot": P_hot_cell,
+    "P_cold": P_cold_cell,
     "h_hot_W_m2K": h_hot_arr,
     "h_cold_W_m2K": h_cold_arr,
     "U_W_m2K": U_arr,
@@ -1175,7 +1527,7 @@ cell_csv_file = save_csv_with_fallback(
 # Plot : temperature + pressure drop
 # ============================================================
 
-fig, ax1 = plt.subplots(figsize=(12, 6))
+fig, ax1 = plt.subplots(figsize=(15, 6.8))
 
 chf_x = None
 dryout_x = None
@@ -1183,57 +1535,77 @@ dryout_x = None
 ax1.plot(
     x,
     T_hot_local - 273.15,
+    color="red",
+    linestyle="-",
     linewidth=3,
-    marker="o",
-    markersize=3,
+    marker=None,
     label="Hot water temperature"
 )
 
 ax1.plot(
     x,
     T_cold_local - 273.15,
+    color="blue",
+    linestyle="-",
     linewidth=3,
-    marker="s",
-    markersize=3,
+    marker=None,
     label="Cold water / steam temperature"
 )
 
 ax1.plot(
     x,
     T_wall_hot - 273.15,
-    linewidth=2.4,
-    linestyle="--",
-    marker="^",
-    markersize=3,
+    color="orange",
+    linestyle="-",
+    linewidth=3,
+    marker=None,
     label="Hot-side wall temperature"
 )
 
 ax1.plot(
     x,
     T_wall_cold - 273.15,
-    linewidth=2.4,
-    linestyle="--",
-    marker="v",
-    markersize=3,
+    color="green",
+    linestyle="-",
+    linewidth=3,
+    marker=None,
     label="Cold-side wall temperature"
 )
 
 ax1.axhline(
-    T_sat - 273.15,
+    T_sat_node[0] - 273.15,
     linestyle="--",
     linewidth=1.5,
-    label=f"Cold saturation temperature = {T_sat - 273.15:.1f} degC"
+    alpha=0.0,
+    label="_hidden_constant_sat_reference"
+)
+
+ax1.plot(
+    x,
+    T_sat_node - 273.15,
+    color="gold",
+    linestyle="-",
+    linewidth=2.5,
+    marker=None,
+    label="Cold saturation temperature"
 )
 
 region_styles = {
     "Single Phase Liquid": {"color": "tab:blue", "alpha": 0.08},
-    "Subcooled Boiling": {"color": "tab:green", "alpha": 0.12},
+    "Subcooled Boiling": {
+        "color": "tab:green",
+        "alpha": 0.24,
+        "edgecolor": "tab:green",
+        "hatch": "///",
+        "linewidth": 1.2,
+    },
     "Saturated Boiling": {"color": "tab:cyan", "alpha": 0.14},
     "CHF / Dryout": {"color": "tab:red", "alpha": 0.12},
     "Superheated Steam": {"color": "tab:purple", "alpha": 0.12},
 }
 
 shown_region_labels = set()
+min_visible_region_width = 0.02 * L
 start_idx = 0
 while start_idx < N:
     region = cold_region[start_idx]
@@ -1244,11 +1616,23 @@ while start_idx < N:
     style = region_styles.get(region)
     if style is not None:
         label = region if region not in shown_region_labels else None
+        span_left = x[start_idx]
+        span_right = x[end_idx]
+
+        if region == "Subcooled Boiling":
+            span_center = 0.5 * (span_left + span_right)
+            visible_width = max(span_right - span_left, min_visible_region_width)
+            span_left = max(x[0], span_center - 0.5 * visible_width)
+            span_right = min(x[-1], span_center + 0.5 * visible_width)
+
         ax1.axvspan(
-            x[start_idx],
-            x[end_idx],
-            color=style["color"],
+            span_left,
+            span_right,
+            facecolor=style["color"],
             alpha=style["alpha"],
+            edgecolor=style.get("edgecolor", None),
+            hatch=style.get("hatch", None),
+            linewidth=style.get("linewidth", 0.0),
             label=label
         )
         shown_region_labels.add(region)
@@ -1259,17 +1643,17 @@ if x_onb is not None:
     ax1.axvline(
         x_onb,
         color="tab:orange",
-        linestyle=":",
-        linewidth=2.4,
-        label="ONB start: Bergles-Rohsenow"
+        linestyle="--",
+        linewidth=2,
+        label="ONB start"
     )
 
 if chf_x is not None:
     ax1.axvline(
         chf_x,
         color="tab:red",
-        linestyle=":",
-        linewidth=2.0,
+        linestyle="--",
+        linewidth=2,
         label="CHF location"
     )
 
@@ -1278,7 +1662,7 @@ if x_chf is not None:
         x_chf,
         color="red",
         linestyle="--",
-        linewidth=2.0,
+        linewidth=2,
         label="CHF start"
     )
 
@@ -1287,7 +1671,7 @@ if x_superheated is not None:
         x_superheated,
         color="tab:purple",
         linestyle="--",
-        linewidth=2.0,
+        linewidth=2,
         label="Superheated Steam start"
     )
 
@@ -1295,8 +1679,8 @@ if dryout_x is not None:
     ax1.axvline(
         dryout_x,
         color="tab:purple",
-        linestyle=":",
-        linewidth=2.0,
+        linestyle="--",
+        linewidth=2,
         label="Dryout start"
     )
 
@@ -1343,34 +1727,125 @@ ax2 = ax1.twinx()
 ax2.plot(
     x,
     dP_cold_cumulative / 1000.0,
-    linewidth=3,
-    linestyle="-.",
+    linewidth=2,
+    linestyle="--",
     label="Cold-side cumulative pressure drop"
 )
 
-ax2.set_ylabel("Cold-side cumulative pressure drop [kPa]")
+ax2.tick_params(axis="y", pad=8)
+ax2.set_ylabel("Cold-side cumulative pressure drop [kPa]", labelpad=14)
 
 lines1, labels1 = ax1.get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
+legend_order = [
+    "Hot water temperature",
+    "Hot-side wall temperature",
+    "Cold water / steam temperature",
+    "Cold-side wall temperature",
+    "Cold saturation temperature",
+    "Single Phase Liquid",
+    "Subcooled Boiling",
+    "Saturated Boiling",
+    "CHF / Dryout",
+    "Superheated Steam",
+    "ONB start",
+    "CHF start",
+    "Superheated Steam start",
+    "Cold-side cumulative pressure drop",
+]
+legend_items = {
+    label: handle
+    for handle, label in zip(lines1 + lines2, labels1 + labels2)
+    if not label.startswith("_")
+}
+ordered_labels = [label for label in legend_order if label in legend_items]
 
 ax1.legend(
-    lines1 + lines2,
-    labels1 + labels2,
-    loc="best"
+    [legend_items[label] for label in ordered_labels],
+    ordered_labels,
+    loc="upper left",
+    bbox_to_anchor=(1.18, 1.0),
+    borderaxespad=0,
+    frameon=True
 )
 
-plt.title(
+ax1.set_title(
     "Counter-flow Steam Generator: Temperature and Pressure Drop",
     fontsize=15,
+    fontweight="bold",
+    pad=18
+)
+
+fig.subplots_adjust(left=0.08, right=0.64, top=0.86, bottom=0.13)
+plt.savefig(
+    "steam_generator_temperature_pressure_drop.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+plt.close(fig)
+
+fig_onb, ax_onb = plt.subplots(figsize=(12, 4.8))
+x_mid = 0.5 * (x[:-1] + x[1:])
+
+ax_onb.plot(
+    x_mid,
+    DeltaT_actual_cell,
+    linewidth=2.6,
+    marker="o",
+    markersize=3,
+    label="DeltaT_actual = T_wall_cold - T_sat"
+)
+ax_onb.plot(
+    x_mid,
+    DeltaT_ONB_cell,
+    linewidth=2.6,
+    marker="s",
+    markersize=3,
+    label="DeltaT_ONB: Bergles-Rohsenow"
+)
+ax_onb.plot(
+    x_mid,
+    ONB_margin_cell,
+    linewidth=2.0,
+    linestyle="--",
+    color="tab:gray",
+    label="ONB_margin = DeltaT_actual - DeltaT_ONB"
+)
+ax_onb.axhline(
+    0.0,
+    color="black",
+    linestyle=":",
+    linewidth=1.3
+)
+
+if x_onb is not None:
+    ax_onb.axvline(
+        x_onb,
+        color="tab:orange",
+        linestyle=":",
+        linewidth=2.4,
+        label="ONB start"
+    )
+
+if FLIP_PLOT_LEFT_RIGHT:
+    ax_onb.invert_xaxis()
+
+ax_onb.set_xlabel(xlabel)
+ax_onb.set_ylabel("Temperature difference [K]")
+ax_onb.set_title(
+    "ONB Criterion Debug: DeltaT_actual vs DeltaT_ONB",
+    fontsize=14,
     fontweight="bold"
 )
+ax_onb.grid(True, linestyle="--", alpha=0.5)
+ax_onb.legend(loc="best")
 
 plt.tight_layout()
 plt.savefig(
-    "steam_generator_temperature_pressure_drop.png",
+    "steam_generator_onb_debug.png",
     dpi=300
 )
-plt.close(fig)
+plt.close(fig_onb)
 
 
 # ============================================================
@@ -1405,6 +1880,10 @@ print(f"Cold outlet at x = L : {T_cold[-1] - 273.15:.2f} degC")
 print(f"Cold outlet target at x = L : {T_cold_out_target - 273.15:.2f} degC")
 print(f"Max hot-side wall temperature : {np.max(T_wall_hot) - 273.15:.2f} degC")
 print(f"Max cold-side wall temperature : {np.max(T_wall_cold) - 273.15:.2f} degC")
+print(f"Hot pressure at x = 0 : {P_hot_node[0] / 1e6:.3f} MPa")
+print(f"Hot pressure at x = L : {P_hot_node[-1] / 1e6:.3f} MPa")
+print(f"Cold pressure at x = 0 : {P_cold_node[0] / 1e6:.3f} MPa")
+print(f"Cold pressure at x = L : {P_cold_node[-1] / 1e6:.3f} MPa")
 
 if T_cold[-1] + 0.1 < T_cold_out_target:
     print(
@@ -1416,6 +1895,13 @@ if x_onb is not None:
     print(f"ONB starts by Bergles-Rohsenow criterion at x = {x_onb:.3f} m")
 else:
     print("ONB not detected by Bergles-Rohsenow criterion.")
+    print("ONB not detected because DeltaT_actual < DeltaT_ONB at all nodes")
+
+print("\n[ONB debug]")
+print(f"max(DeltaT_actual) : {max_deltaT_actual:.6f} K")
+print(f"min(DeltaT_ONB) : {min_deltaT_ONB:.6f} K")
+print(f"max(ONB_margin) : {max_ONB_margin:.6f} K")
+print(f"x at max(ONB_margin) : {x_max_ONB_margin:.6f} m")
 
 if x_chf is not None:
     print(f"CHF starts by Del Col dryout criterion at x = {x_chf:.3f} m")
@@ -1428,8 +1914,9 @@ else:
     print("Superheated Steam not reached.")
 
 print("\n[Cold-side phase change]")
-print(f"T_sat at P_cold = {P_cold / 1e6:.2f} MPa : {T_sat - 273.15:.2f} degC")
-print(f"Latent heat H_fg : {H_fg / 1e3:.2f} kJ/kg")
+print(f"T_sat at cold inlet pressure : {T_sat_node[0] - 273.15:.2f} degC")
+print(f"T_sat at cold outlet pressure : {T_sat_node[-1] - 273.15:.2f} degC")
+print(f"Latent heat H_fg at cold inlet : {H_fg / 1e3:.2f} kJ/kg")
 print(f"Cold outlet quality at x = L : {quality[-1]:.3f}")
 print(f"Cold outlet phase : {phase[-1]}")
 
@@ -1437,6 +1924,13 @@ print("\n[Pressure drop]")
 print(f"Pressure drop model in boiling region : {pressure_drop_model}")
 print(f"Total cold-side pressure drop : {dP_cold_cumulative[-1] / 1000.0:.3f} kPa")
 print(f"Total hot-side pressure drop  : {np.sum(dP_hot_cell) / 1000.0:.3f} kPa")
+
+finite_xdi_raw = x_di_raw_cell[np.isfinite(x_di_raw_cell)]
+finite_xdi = x_di_cell[np.isfinite(x_di_cell)]
+if finite_xdi.size > 0:
+    print("\n[CHF / Dryout criterion]")
+    print("Dryout x_di is calculated from Del Col et al. (2010) local conditions.")
+    print(f"Del Col local x_di range : {np.min(finite_xdi):.3f} - {np.max(finite_xdi):.3f}")
 
 print("\n[Cold-side heat transfer correlation]")
 print(df_cell["cold_heat_transfer_correlation"].value_counts())
@@ -1447,6 +1941,8 @@ print(df_cell["pressure_drop_correlation"].value_counts())
 print("\nCSV saved:")
 print(node_csv_file)
 print(cell_csv_file)
-print("Figure saved:")
+print("Figure saved:") 
 print("steam_generator_temperature_pressure_drop.png")
+print("steam_generator_onb_debug.png")
 print("==============================")
+ 
